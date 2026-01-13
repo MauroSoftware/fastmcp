@@ -165,6 +165,26 @@ class LowLevelServer(_Server[LifespanResultT, RequestT]):
             **kwargs,
         )
 
+    def get_capabilities(
+        self,
+        notification_options: NotificationOptions,
+        experimental_capabilities: dict[str, dict[str, Any]],
+    ) -> mcp.types.ServerCapabilities:
+        """Override to enable resource subscription support."""
+        capabilities = super().get_capabilities(
+            notification_options, experimental_capabilities
+        )
+        
+        # Enable resource subscriptions if resources are supported
+        if capabilities.resources is not None:
+            # Create new ResourcesCapability with subscribe=True
+            capabilities.resources = mcp.types.ResourcesCapability(
+                subscribe=True,
+                listChanged=capabilities.resources.listChanged,
+            )
+        
+        return capabilities
+
     async def run(
         self,
         read_stream: MemoryObjectReceiveStream[SessionMessage | Exception],
@@ -188,18 +208,24 @@ class LowLevelServer(_Server[LifespanResultT, RequestT]):
                 )
             )
 
-            async with anyio.create_task_group() as tg:
-                # Store task group on session for subscription tasks (SEP-1686)
-                session._subscription_task_group = tg
+            try:
+                async with anyio.create_task_group() as tg:
+                    # Store task group on session for subscription tasks (SEP-1686)
+                    session._subscription_task_group = tg
 
-                async for message in session.incoming_messages:
-                    tg.start_soon(
-                        self._handle_message,
-                        message,
-                        session,
-                        lifespan_context,
-                        raise_exceptions,
-                    )
+                    async for message in session.incoming_messages:
+                        tg.start_soon(
+                            self._handle_message,
+                            message,
+                            session,
+                            lifespan_context,
+                            raise_exceptions,
+                        )
+            finally:
+                # Clean up resource subscriptions when session disconnects
+                await self.fastmcp._resource_subscription_manager.cleanup_on_disconnect(
+                    session
+                )
 
     def read_resource(
         self,

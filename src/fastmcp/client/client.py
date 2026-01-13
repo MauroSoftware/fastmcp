@@ -608,6 +608,16 @@ class Client(Generic[ClientTransportT]):
         that was resetting events outside the lock, causing race conditions.
         Event recreation now happens only in _connect() when actually needed.
         """
+        # Clean up resource subscriptions before disconnecting
+        if hasattr(self, "_subscribed_resources"):
+            for uri in list(self._subscribed_resources):
+                try:
+                    await self.unsubscribe_resource(uri)
+                except Exception:
+                    # Ignore errors during cleanup
+                    pass
+            self._subscribed_resources.clear()
+        
         # ensure only one session is running at a time to avoid race conditions
         async with self._session_state.lock:
             # if we are forcing a disconnect, reset the nesting counter
@@ -1024,17 +1034,34 @@ class Client(Generic[ClientTransportT]):
                 immediate_result=raw_result.contents,
             )
 
-    # async def subscribe_resource(self, uri: AnyUrl | str) -> None:
-    #     """Send a resources/subscribe request."""
-    #     if isinstance(uri, str):
-    #         uri = AnyUrl(uri)
-    #     await self.session.subscribe_resource(uri)
+    async def subscribe_resource(self, uri: AnyUrl | str) -> None:
+        """Subscribe to notifications when a resource is updated.
+        
+        Args:
+            uri: The resource URI to subscribe to
+        """
+        if isinstance(uri, str):
+            uri = AnyUrl(uri)
+        await self.session.subscribe_resource(uri)
+        
+        # Track subscribed resources
+        if not hasattr(self, "_subscribed_resources"):
+            self._subscribed_resources: set[str] = set()
+        self._subscribed_resources.add(str(uri))
 
-    # async def unsubscribe_resource(self, uri: AnyUrl | str) -> None:
-    #     """Send a resources/unsubscribe request."""
-    #     if isinstance(uri, str):
-    #         uri = AnyUrl(uri)
-    #     await self.session.unsubscribe_resource(uri)
+    async def unsubscribe_resource(self, uri: AnyUrl | str) -> None:
+        """Unsubscribe from resource update notifications.
+        
+        Args:
+            uri: The resource URI to unsubscribe from
+        """
+        if isinstance(uri, str):
+            uri = AnyUrl(uri)
+        await self.session.unsubscribe_resource(uri)
+        
+        # Remove from tracked resources
+        if hasattr(self, "_subscribed_resources"):
+            self._subscribed_resources.discard(str(uri))
 
     # --- Prompts ---
 

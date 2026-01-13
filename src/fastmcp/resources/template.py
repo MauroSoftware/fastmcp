@@ -352,7 +352,31 @@ class FunctionResourceTemplate(ResourceTemplate):
 
         # Synchronous execution - call read() directly, skip resource creation
         result = await self.read(arguments=params)
+        
+        # Notify subscribers after successful read
+        await self._notify_resource_updated(uri)
+        
         return self.convert_result(result)
+
+    async def _notify_resource_updated(self, uri: str) -> None:
+        """Notify subscribers that a resource from this template has been updated.
+        
+        Args:
+            uri: The concrete URI that was accessed
+        """
+        try:
+            import fastmcp.server.context
+            
+            # Get the current context to access the FastMCP instance
+            context = fastmcp.server.context._current_context.get(None)
+            if context is not None:
+                # Notify subscribers through the subscription manager
+                await context.fastmcp._resource_subscription_manager.notify_subscribers(
+                    uri
+                )
+        except Exception:
+            # Don't let notification failures break resource reads
+            pass
 
     async def create_resource(self, uri: str, params: dict[str, Any]) -> Resource:
         """Create a resource from the template with the given parameters."""
