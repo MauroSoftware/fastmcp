@@ -378,6 +378,9 @@ class FastMCP(Generic[LifespanResultT]):
 
         self.middleware: list[Middleware] = list(middleware or [])
 
+        # Set up resource subscription manager
+        self._resource_subscription_manager = ResourceSubscriptionManager()
+
         # Set up MCP protocol handlers
         self._setup_handlers()
 
@@ -697,6 +700,9 @@ class FastMCP(Generic[LifespanResultT]):
         # Register SEP-1686 task protocol handlers
         self._setup_task_protocol_handlers()
 
+        # Register resource subscription handlers
+        self._setup_resource_subscription_handlers()
+
     def _setup_task_protocol_handlers(self) -> None:
         """Register SEP-1686 task protocol handlers with SDK.
 
@@ -757,6 +763,48 @@ class FastMCP(Generic[LifespanResultT]):
         )
         self._mcp_server.request_handlers[ListTasksRequest] = handle_list_tasks
         self._mcp_server.request_handlers[CancelTaskRequest] = handle_cancel_task
+
+    def _setup_resource_subscription_handlers(self) -> None:
+        """Register resource subscription handlers with SDK.
+        
+        Handles resources/subscribe and resources/unsubscribe requests.
+        """
+        from mcp.server.lowlevel.server import request_ctx
+        from mcp.types import (
+            EmptyResult,
+            ServerResult,
+            SubscribeRequest,
+            UnsubscribeRequest,
+        )
+
+        from fastmcp.server.resources.handlers import (
+            handle_subscribe_resource_request,
+            handle_unsubscribe_resource_request,
+        )
+
+        async def handle_subscribe(req: SubscribeRequest) -> ServerResult:
+            # Get session from MCP SDK's request context
+            ctx = request_ctx.get()
+            session = ctx.session
+            
+            await handle_subscribe_resource_request(
+                str(req.params.uri), session, self
+            )
+            return ServerResult(EmptyResult())
+
+        async def handle_unsubscribe(req: UnsubscribeRequest) -> ServerResult:
+            # Get session from MCP SDK's request context
+            ctx = request_ctx.get()
+            session = ctx.session
+            
+            await handle_unsubscribe_resource_request(
+                str(req.params.uri), session, self
+            )
+            return ServerResult(EmptyResult())
+
+        # Register handlers with SDK
+        self._mcp_server.request_handlers[SubscribeRequest] = handle_subscribe
+        self._mcp_server.request_handlers[UnsubscribeRequest] = handle_unsubscribe
 
     async def _run_middleware(
         self,
@@ -2124,6 +2172,37 @@ class FastMCP(Generic[LifespanResultT]):
             The template instance that was added to the server.
         """
         return self._local_provider.add_template(template)
+
+    async def notify_resource_updated(self, uri: str) -> None:
+        """Notify all subscribers that a resource has been updated.
+        
+        Call this method when the content of a resource changes to notify
+        subscribed clients. Clients can then decide whether to fetch the
+        updated content via resources/read.
+        
+        This follows the MCP decoupled pub/sub model: notifications are sent
+        when data changes, not when resources are read.
+        
+        Args:
+            uri: The URI of the resource that was updated
+            
+        Example:
+            ```python
+            server = FastMCP("my-server")
+            
+            sensor_data = {"temperature": 20}
+            
+            @server.resource("resource://sensors/temp")
+            def get_temperature() -> str:
+                return f"Temperature: {sensor_data['temperature']}°C"
+            
+            # When data changes, notify subscribers
+            async def update_temperature(new_temp: int):
+                sensor_data['temperature'] = new_temp
+                await server.notify_resource_updated("resource://sensors/temp")
+            ```
+        """
+        await self._resource_subscription_manager.notify_subscribers(uri)
 
     def resource(
         self,
