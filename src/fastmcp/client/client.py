@@ -613,9 +613,11 @@ class Client(Generic[ClientTransportT]):
             for uri in list(self._subscribed_resources):
                 try:
                     await self.unsubscribe_resource(uri)
-                except Exception:
-                    # Ignore errors during cleanup
-                    pass
+                except Exception as e:
+                    # Log cleanup failures for debugging
+                    logger.debug(
+                        f"Failed to unsubscribe from resource {uri} during disconnect: {e}"
+                    )
             self._subscribed_resources.clear()
         
         # ensure only one session is running at a time to avoid race conditions

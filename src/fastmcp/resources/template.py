@@ -374,9 +374,12 @@ class FunctionResourceTemplate(ResourceTemplate):
                 await context.fastmcp._resource_subscription_manager.notify_subscribers(
                     uri
                 )
-        except Exception:
+        except Exception as e:
             # Don't let notification failures break resource reads
-            pass
+            # Log at debug level for troubleshooting
+            from fastmcp.utilities.logging import get_logger
+            logger = get_logger(__name__)
+            logger.debug(f"Failed to notify resource subscribers for {uri}: {e}")
 
     async def create_resource(self, uri: str, params: dict[str, Any]) -> Resource:
         """Create a resource from the template with the given parameters."""

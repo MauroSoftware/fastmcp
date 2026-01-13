@@ -365,9 +365,12 @@ class Resource(FastMCPComponent):
                 await context.fastmcp._resource_subscription_manager.notify_subscribers(
                     str(self.uri)
                 )
-        except Exception:
+        except Exception as e:
             # Don't let notification failures break resource reads
-            pass
+            # Log at debug level for troubleshooting
+            from fastmcp.utilities.logging import get_logger
+            logger = get_logger(__name__)
+            logger.debug(f"Failed to notify resource subscribers for {self.uri}: {e}")
 
     def to_mcp_resource(
         self,
