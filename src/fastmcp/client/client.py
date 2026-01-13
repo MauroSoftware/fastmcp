@@ -609,15 +609,8 @@ class Client(Generic[ClientTransportT]):
         Event recreation now happens only in _connect() when actually needed.
         """
         # Clean up resource subscriptions before disconnecting
+        # Server handles actual unsubscription in its cleanup
         if hasattr(self, "_subscribed_resources"):
-            for uri in list(self._subscribed_resources):
-                try:
-                    await self.unsubscribe_resource(uri)
-                except Exception as e:
-                    # Log cleanup failures for debugging
-                    logger.debug(
-                        f"Failed to unsubscribe from resource {uri} during disconnect: {e}"
-                    )
             self._subscribed_resources.clear()
         
         # ensure only one session is running at a time to avoid race conditions

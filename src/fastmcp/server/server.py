@@ -1931,6 +1931,37 @@ class FastMCP(Generic[LifespanResultT]):
         """
         return self._local_provider.add_template(template)
 
+    async def notify_resource_updated(self, uri: str) -> None:
+        """Notify all subscribers that a resource has been updated.
+        
+        Call this method when the content of a resource changes to notify
+        subscribed clients. Clients can then decide whether to fetch the
+        updated content via resources/read.
+        
+        This follows the MCP decoupled pub/sub model: notifications are sent
+        when data changes, not when resources are read.
+        
+        Args:
+            uri: The URI of the resource that was updated
+            
+        Example:
+            ```python
+            server = FastMCP("my-server")
+            
+            sensor_data = {"temperature": 20}
+            
+            @server.resource("resource://sensors/temp")
+            def get_temperature() -> str:
+                return f"Temperature: {sensor_data['temperature']}°C"
+            
+            # When data changes, notify subscribers
+            async def update_temperature(new_temp: int):
+                sensor_data['temperature'] = new_temp
+                await server.notify_resource_updated("resource://sensors/temp")
+            ```
+        """
+        await self._resource_subscription_manager.notify_subscribers(uri)
+
     def resource(
         self,
         uri: str,
