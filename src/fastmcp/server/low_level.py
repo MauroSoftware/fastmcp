@@ -195,6 +195,11 @@ class LowLevelServer(_Server[LifespanResultT, RequestT]):
     ):
         """
         Overrides the run method to use the MiddlewareServerSession.
+        
+        This method is the entry point for all FastMCP transports (stdio, SSE,
+        streamable HTTP). The finally block ensures resource subscription cleanup
+        happens for every session regardless of how the session ends (normal
+        completion, error, or cancellation).
         """
         async with AsyncExitStack() as stack:
             lifespan_context = await stack.enter_async_context(self.lifespan(self))
@@ -223,6 +228,7 @@ class LowLevelServer(_Server[LifespanResultT, RequestT]):
                         )
             finally:
                 # Clean up resource subscriptions when session disconnects
+                # This runs for all transports and all exit paths (normal/error/cancel)
                 await self.fastmcp._resource_subscription_manager.cleanup_on_disconnect(
                     session
                 )

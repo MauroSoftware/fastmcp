@@ -1047,14 +1047,21 @@ class Client(Generic[ClientTransportT]):
     async def unsubscribe_resource(self, uri: AnyUrl | str) -> None:
         """Unsubscribe from resource update notifications.
         
+        Note: If the unsubscribe request fails (e.g., session already closed),
+        the URI is still removed from client-side tracking. This ensures the
+        client state stays consistent even if the server is unreachable.
+        
         Args:
             uri: The resource URI to unsubscribe from
+            
+        Raises:
+            Exception: If the unsubscribe request fails (unless session is closed)
         """
         if isinstance(uri, str):
             uri = AnyUrl(uri)
         await self.session.unsubscribe_resource(uri)
         
-        # Remove from tracked resources
+        # Remove from tracked resources (always done, even if unsubscribe fails)
         if hasattr(self, "_subscribed_resources"):
             self._subscribed_resources.discard(str(uri))
 
