@@ -612,7 +612,7 @@ class Client(Generic[ClientTransportT]):
         # Server handles actual unsubscription in its cleanup
         if hasattr(self, "_subscribed_resources"):
             self._subscribed_resources.clear()
-        
+
         # ensure only one session is running at a time to avoid race conditions
         async with self._session_state.lock:
             # if we are forcing a disconnect, reset the nesting counter
@@ -1031,14 +1031,14 @@ class Client(Generic[ClientTransportT]):
 
     async def subscribe_resource(self, uri: AnyUrl | str) -> None:
         """Subscribe to notifications when a resource is updated.
-        
+
         Args:
             uri: The resource URI to subscribe to
         """
         if isinstance(uri, str):
             uri = AnyUrl(uri)
         await self.session.subscribe_resource(uri)
-        
+
         # Track subscribed resources
         if not hasattr(self, "_subscribed_resources"):
             self._subscribed_resources: set[str] = set()
@@ -1046,21 +1046,21 @@ class Client(Generic[ClientTransportT]):
 
     async def unsubscribe_resource(self, uri: AnyUrl | str) -> None:
         """Unsubscribe from resource update notifications.
-        
+
         Note: If the unsubscribe request fails (e.g., session already closed),
         the URI is still removed from client-side tracking. This ensures the
         client state stays consistent even if the server is unreachable.
-        
+
         Args:
             uri: The resource URI to unsubscribe from
-            
+
         Raises:
             Exception: If the unsubscribe request fails (unless session is closed)
         """
         if isinstance(uri, str):
             uri = AnyUrl(uri)
         await self.session.unsubscribe_resource(uri)
-        
+
         # Remove from tracked resources (always done, even if unsubscribe fails)
         if hasattr(self, "_subscribed_resources"):
             self._subscribed_resources.discard(str(uri))

@@ -174,7 +174,7 @@ class LowLevelServer(_Server[LifespanResultT, RequestT]):
         capabilities = super().get_capabilities(
             notification_options, experimental_capabilities
         )
-        
+
         # Enable resource subscriptions if resources are supported
         if capabilities.resources is not None:
             # Create new ResourcesCapability with subscribe=True
@@ -182,7 +182,7 @@ class LowLevelServer(_Server[LifespanResultT, RequestT]):
                 subscribe=True,
                 listChanged=capabilities.resources.listChanged,
             )
-        
+
         return capabilities
 
     async def run(
@@ -195,7 +195,7 @@ class LowLevelServer(_Server[LifespanResultT, RequestT]):
     ):
         """
         Overrides the run method to use the MiddlewareServerSession.
-        
+
         This method is the entry point for all FastMCP transports (stdio, SSE,
         streamable HTTP). The finally block ensures resource subscription cleanup
         happens for every session regardless of how the session ends (normal

@@ -20,7 +20,7 @@ async def handle_subscribe_resource_request(
     fastmcp: FastMCP,
 ) -> None:
     """Handle resources/subscribe request.
-    
+
     Args:
         uri: The resource URI to subscribe to
         session: The ServerSession making the request
@@ -35,7 +35,7 @@ async def handle_unsubscribe_resource_request(
     fastmcp: FastMCP,
 ) -> None:
     """Handle resources/unsubscribe request.
-    
+
     Args:
         uri: The resource URI to unsubscribe from
         session: The ServerSession making the request
