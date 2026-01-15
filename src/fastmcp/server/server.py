@@ -55,6 +55,7 @@ from typing_extensions import Self
 import fastmcp
 import fastmcp.server
 from fastmcp.exceptions import (
+    AuthorizationError,
     DisabledError,
     FastMCPError,
     NotFoundError,
@@ -65,10 +66,12 @@ from fastmcp.exceptions import (
 )
 from fastmcp.mcp_config import MCPConfig
 from fastmcp.prompts import Prompt
-from fastmcp.prompts.prompt import FunctionPrompt, PromptResult
+from fastmcp.prompts.function_prompt import FunctionPrompt
+from fastmcp.prompts.prompt import PromptResult
 from fastmcp.resources.resource import Resource, ResourceResult
 from fastmcp.resources.template import ResourceTemplate
-from fastmcp.server.auth import AuthProvider
+from fastmcp.server.auth import AuthContext, AuthProvider, run_auth_checks
+from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.event_store import EventStore
 from fastmcp.server.http import (
     StarletteWithLifespan,
@@ -79,19 +82,25 @@ from fastmcp.server.lifespan import Lifespan
 from fastmcp.server.low_level import LowLevelServer
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.providers import LocalProvider, Provider
+from fastmcp.server.providers.aggregate import AggregateProvider
 from fastmcp.server.resources import ResourceSubscriptionManager
 from fastmcp.server.tasks.capabilities import get_task_capabilities
 from fastmcp.server.tasks.config import TaskConfig, TaskMeta
+from fastmcp.server.transforms import (
+    Namespace,
+    ToolTransform,
+    Transform,
+    Visibility,
+)
 from fastmcp.settings import DuplicateBehavior as DuplicateBehaviorSetting
 from fastmcp.settings import Settings
-from fastmcp.tools.tool import FunctionTool, Tool, ToolResult
+from fastmcp.tools.function_tool import FunctionTool
+from fastmcp.tools.tool import AuthCheckCallable, Tool, ToolResult
 from fastmcp.tools.tool_transform import ToolTransformConfig
-from fastmcp.utilities.async_utils import gather
 from fastmcp.utilities.cli import log_server_banner
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.logging import get_logger, temporary_log_level
 from fastmcp.utilities.types import NotSet, NotSetT
-from fastmcp.utilities.visibility import VisibilityFilter
 
 if TYPE_CHECKING:
     from docket import Docket
@@ -157,6 +166,23 @@ LifespanCallable = Callable[
 ]
 
 
+def _get_auth_context() -> tuple[bool, Any]:
+    """Get auth context for the current request.
+
+    Returns a tuple of (skip_auth, token) where:
+    - skip_auth=True means auth checks should be skipped (STDIO transport)
+    - token is the access token for HTTP transports (may be None if unauthenticated)
+
+    Uses late import to avoid circular import with context.py.
+    """
+    from fastmcp.server.context import _current_transport
+
+    is_stdio = _current_transport.get() == "stdio"
+    if is_stdio:
+        return (True, None)
+    return (False, get_access_token())
+
+
 @asynccontextmanager
 async def default_lifespan(server: FastMCP[LifespanResultT]) -> AsyncIterator[Any]:
     """Default lifespan context manager that does nothing.
@@ -209,7 +235,6 @@ class FastMCP(Generic[LifespanResultT]):
         lifespan: LifespanCallable | Lifespan | None = None,
         mask_error_details: bool | None = None,
         tools: Sequence[Tool | Callable[..., Any]] | None = None,
-        tool_transformations: Mapping[str, ToolTransformConfig] | None = None,
         tool_serializer: ToolResultSerializerType | None = None,
         include_tags: Collection[str] | None = None,
         exclude_tags: Collection[str] | None = None,
@@ -234,6 +259,7 @@ class FastMCP(Generic[LifespanResultT]):
         stateless_http: bool | None = None,
         sampling_handler: SamplingHandler | None = None,
         sampling_handler_behavior: Literal["always", "fallback"] | None = None,
+        tool_transformations: Mapping[str, ToolTransformConfig] | None = None,
     ):
         # Resolve on_duplicate from deprecated params (delete when removing deprecation)
         self._on_duplicate: DuplicateBehaviorSetting = _resolve_on_duplicate(
@@ -257,12 +283,10 @@ class FastMCP(Generic[LifespanResultT]):
             on_duplicate=self._on_duplicate
         )
 
-        # Apply tool transformations to LocalProvider
-        if tool_transformations:
-            for tool_name, transformation in tool_transformations.items():
-                self._local_provider.add_tool_transformation(tool_name, transformation)
+        # Server-level transforms (applied after provider aggregation)
+        self._transforms: list[Transform] = []
 
-        # LocalProvider is always first in the provider list
+        # Local provider is always first in the provider list
         self._providers: list[Provider] = [
             self._local_provider,
             *(providers or []),
@@ -315,8 +339,8 @@ class FastMCP(Generic[LifespanResultT]):
                     tool = Tool.from_function(tool, serializer=self._tool_serializer)
                 self.add_tool(tool)
 
-        # Server-level visibility filter for runtime enable/disable
-        self._visibility = VisibilityFilter()
+        # Server-level visibility for runtime enable/disable
+        self._visibility = Visibility()
 
         # Emit deprecation warnings for include_tags and exclude_tags
         if include_tags is not None:
@@ -335,6 +359,17 @@ class FastMCP(Generic[LifespanResultT]):
             )
             # For backwards compatibility, initialize blocklist from exclude_tags
             self._visibility.disable(tags=set(exclude_tags))
+
+        # Handle deprecated tool_transformations parameter
+        if tool_transformations:
+            if fastmcp.settings.deprecation_warnings:
+                warnings.warn(
+                    "The tool_transformations parameter is deprecated. Use "
+                    "server.add_transform(ToolTransform({...})) instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            self._transforms.append(ToolTransform(dict(tool_transformations)))
 
         self.strict_input_validation: bool = (
             strict_input_validation
@@ -484,24 +519,17 @@ class FastMCP(Generic[LifespanResultT]):
                 yield
                 return
 
-            # Collect task-enabled components from all providers at startup.
+            # Collect task-enabled components at startup with all transforms applied.
+            # Uses _source_get_tasks() to include both provider and server-level transforms.
             # Components must be available now to be registered with Docket workers;
             # dynamically added components after startup won't be registered.
-            task_results = await gather(
-                *[p.get_tasks() for p in self._providers],
-                return_exceptions=True,
-            )
-
-            # Flatten and filter results, collecting components and errors
-            task_components: list[FastMCPComponent] = []
-            for i, result in enumerate(task_results):
-                if isinstance(result, BaseException):
-                    provider = self._providers[i]
-                    logger.warning(f"Failed to get tasks from {provider}: {result}")
-                    if fastmcp.settings.mounted_components_raise_on_load_error:
-                        raise result
-                    continue
-                task_components.extend(result)
+            try:
+                task_components = list(await self._source_get_tasks())
+            except Exception as e:
+                logger.warning(f"Failed to get tasks: {e}")
+                if fastmcp.settings.mounted_components_raise_on_load_error:
+                    raise
+                task_components = []
 
             # If no task-enabled components, skip Docket infrastructure entirely
             if not task_components:
@@ -542,7 +570,7 @@ class FastMCP(Generic[LifespanResultT]):
                         worker_kwargs["name"] = settings.docket.worker_name
 
                     # Create and start Worker
-                    async with Worker(docket, **worker_kwargs) as worker:  # type: ignore[arg-type]
+                    async with Worker(docket, **worker_kwargs) as worker:
                         # Store on server instance for cross-context access
                         self._worker = worker
                         # Set Worker in ContextVar so CurrentWorker can access it
@@ -739,7 +767,7 @@ class FastMCP(Generic[LifespanResultT]):
 
     def _setup_resource_subscription_handlers(self) -> None:
         """Register resource subscription handlers with SDK.
-        
+
         Handles resources/subscribe and resources/unsubscribe requests.
         """
         from mcp.server.lowlevel.server import request_ctx
@@ -759,17 +787,15 @@ class FastMCP(Generic[LifespanResultT]):
             # Get session from MCP SDK's request context
             ctx = request_ctx.get()
             session = ctx.session
-            
-            await handle_subscribe_resource_request(
-                str(req.params.uri), session, self
-            )
+
+            await handle_subscribe_resource_request(str(req.params.uri), session, self)
             return ServerResult(EmptyResult())
 
         async def handle_unsubscribe(req: UnsubscribeRequest) -> ServerResult:
             # Get session from MCP SDK's request context
             ctx = request_ctx.get()
             session = ctx.session
-            
+
             await handle_unsubscribe_resource_request(
                 str(req.params.uri), session, self
             )
@@ -804,6 +830,238 @@ class FastMCP(Generic[LifespanResultT]):
             provider: A Provider instance that will provide components dynamically.
         """
         self._providers.append(provider)
+
+    # -------------------------------------------------------------------------
+    # Tool Transforms
+    # -------------------------------------------------------------------------
+
+    def _get_root_provider(self) -> AggregateProvider:
+        """Get the root provider (aggregate of all providers).
+
+        Returns an AggregateProvider wrapping all providers. Each provider
+        applies its own transforms and provider-level visibility.
+        Server-level transforms and visibility are applied by _source_* methods.
+        """
+        return AggregateProvider(self._providers)
+
+    def _get_all_transforms(self) -> list[Transform]:
+        """Get all server-level transforms (including visibility as last)."""
+        return [*self._transforms, self._visibility]
+
+    # -------------------------------------------------------------------------
+    # Server-level transform chain building
+    # -------------------------------------------------------------------------
+
+    async def _source_list_tools(self) -> Sequence[Tool]:
+        """List tools with all transforms applied (provider + server)."""
+        root = self._get_root_provider()
+
+        async def base() -> Sequence[Tool]:
+            return await root.list_tools()
+
+        chain = base
+        for transform in self._get_all_transforms():
+            chain = partial(transform.list_tools, call_next=chain)
+
+        return await chain()
+
+    async def _source_get_tool(self, name: str) -> Tool | None:
+        """Get tool by name with all transforms applied (provider + server)."""
+        root = self._get_root_provider()
+
+        async def base(n: str) -> Tool | None:
+            return await root.get_tool(n)
+
+        chain = base
+        for transform in self._get_all_transforms():
+            chain = partial(transform.get_tool, call_next=chain)
+
+        return await chain(name)
+
+    async def _source_list_resources(self) -> Sequence[Resource]:
+        """List resources with all transforms applied (provider + server)."""
+        root = self._get_root_provider()
+
+        async def base() -> Sequence[Resource]:
+            return await root.list_resources()
+
+        chain = base
+        for transform in self._get_all_transforms():
+            chain = partial(transform.list_resources, call_next=chain)
+
+        return await chain()
+
+    async def _source_get_resource(self, uri: str) -> Resource | None:
+        """Get resource by URI with all transforms applied (provider + server)."""
+        root = self._get_root_provider()
+
+        async def base(u: str) -> Resource | None:
+            return await root.get_resource(u)
+
+        chain = base
+        for transform in self._get_all_transforms():
+            chain = partial(transform.get_resource, call_next=chain)
+
+        return await chain(uri)
+
+    async def _source_list_resource_templates(self) -> Sequence[ResourceTemplate]:
+        """List resource templates with all transforms applied (provider + server)."""
+        root = self._get_root_provider()
+
+        async def base() -> Sequence[ResourceTemplate]:
+            return await root.list_resource_templates()
+
+        chain = base
+        for transform in self._get_all_transforms():
+            chain = partial(transform.list_resource_templates, call_next=chain)
+
+        return await chain()
+
+    async def _source_get_resource_template(self, uri: str) -> ResourceTemplate | None:
+        """Get resource template by URI with all transforms applied (provider + server)."""
+        root = self._get_root_provider()
+
+        async def base(u: str) -> ResourceTemplate | None:
+            return await root.get_resource_template(u)
+
+        chain = base
+        for transform in self._get_all_transforms():
+            chain = partial(transform.get_resource_template, call_next=chain)
+
+        return await chain(uri)
+
+    async def _source_list_prompts(self) -> Sequence[Prompt]:
+        """List prompts with all transforms applied (provider + server)."""
+        root = self._get_root_provider()
+
+        async def base() -> Sequence[Prompt]:
+            return await root.list_prompts()
+
+        chain = base
+        for transform in self._get_all_transforms():
+            chain = partial(transform.list_prompts, call_next=chain)
+
+        return await chain()
+
+    async def _source_get_prompt(self, name: str) -> Prompt | None:
+        """Get prompt by name with all transforms applied (provider + server)."""
+        root = self._get_root_provider()
+
+        async def base(n: str) -> Prompt | None:
+            return await root.get_prompt(n)
+
+        chain = base
+        for transform in self._get_all_transforms():
+            chain = partial(transform.get_prompt, call_next=chain)
+
+        return await chain(name)
+
+    async def _source_get_tasks(self) -> Sequence[FastMCPComponent]:
+        """Get tasks with all transforms applied (provider + server).
+
+        Collects task-eligible components from all providers and applies
+        server-level transforms to ensure task registration uses transformed names.
+        """
+        root = self._get_root_provider()
+        components = list(await root.get_tasks())
+
+        # Separate by component type for transform application
+        tools = [c for c in components if isinstance(c, Tool)]
+        resources = [c for c in components if isinstance(c, Resource)]
+        templates = [c for c in components if isinstance(c, ResourceTemplate)]
+        prompts = [c for c in components if isinstance(c, Prompt)]
+
+        # Apply server-level transforms using call_next pattern
+        async def tools_base() -> Sequence[Tool]:
+            return tools
+
+        async def resources_base() -> Sequence[Resource]:
+            return resources
+
+        async def templates_base() -> Sequence[ResourceTemplate]:
+            return templates
+
+        async def prompts_base() -> Sequence[Prompt]:
+            return prompts
+
+        tools_chain = tools_base
+        resources_chain = resources_base
+        templates_chain = templates_base
+        prompts_chain = prompts_base
+
+        for transform in self._get_all_transforms():
+            tools_chain = partial(transform.list_tools, call_next=tools_chain)
+            resources_chain = partial(
+                transform.list_resources, call_next=resources_chain
+            )
+            templates_chain = partial(
+                transform.list_resource_templates, call_next=templates_chain
+            )
+            prompts_chain = partial(transform.list_prompts, call_next=prompts_chain)
+
+        transformed_tools = await tools_chain()
+        transformed_resources = await resources_chain()
+        transformed_templates = await templates_chain()
+        transformed_prompts = await prompts_chain()
+
+        return [
+            *transformed_tools,
+            *transformed_resources,
+            *transformed_templates,
+            *transformed_prompts,
+        ]
+
+    def add_transform(self, transform: Transform) -> None:
+        """Add a server-level transform.
+
+        Server-level transforms are applied after all providers are aggregated.
+        They transform tools, resources, and prompts from ALL providers.
+
+        Args:
+            transform: The transform to add.
+
+        Example:
+            ```python
+            from fastmcp.server.transforms import Namespace
+
+            server = FastMCP("Server")
+            server.add_transform(Namespace("api"))
+            # All tools from all providers become "api_toolname"
+            ```
+        """
+        self._transforms.append(transform)
+
+    def add_tool_transformation(
+        self, tool_name: str, transformation: ToolTransformConfig
+    ) -> None:
+        """Add a tool transformation.
+
+        .. deprecated::
+            Use ``add_transform(ToolTransform({...}))`` instead.
+        """
+        if fastmcp.settings.deprecation_warnings:
+            warnings.warn(
+                "add_tool_transformation is deprecated. Use "
+                "server.add_transform(ToolTransform({tool_name: config})) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self.add_transform(ToolTransform({tool_name: transformation}))
+
+    def remove_tool_transformation(self, _tool_name: str) -> None:
+        """Remove a tool transformation.
+
+        .. deprecated::
+            Tool transformations are now immutable. Use visibility controls instead.
+        """
+        if fastmcp.settings.deprecation_warnings:
+            warnings.warn(
+                "remove_tool_transformation is deprecated and has no effect. "
+                "Transforms are immutable once added. Use server.disable(keys=[...]) "
+                "to hide tools instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
     # -------------------------------------------------------------------------
     # Enable/Disable
@@ -880,8 +1138,8 @@ class FastMCP(Generic[LifespanResultT]):
     async def get_tools(self, *, run_middleware: bool = False) -> list[Tool]:
         """Get all enabled tools from providers.
 
-        Queries all providers in parallel and collects tools.
-        First provider wins for duplicate keys. Filters by server blocklist.
+        Queries all providers via the root provider (which applies provider transforms,
+        server transforms, and visibility filtering). First provider wins for duplicate keys.
 
         Args:
             run_middleware: If True, apply the middleware chain before
@@ -903,52 +1161,53 @@ class FastMCP(Generic[LifespanResultT]):
                     )
                 )
 
-        results = await gather(
-            *[p.list_tools() for p in self._providers],
-            return_exceptions=True,
-        )
+        # Query through full transform chain (provider transforms + server transforms + visibility)
+        tools = await self._source_list_tools()
 
-        all_tools: dict[str, Tool] = {}
-        for i, result in enumerate(results):
-            if isinstance(result, BaseException):
-                provider = self._providers[i]
-                logger.exception(f"Error listing tools from provider {provider}")
-                if fastmcp.settings.mounted_components_raise_on_load_error:
-                    raise result
+        # Get auth context (skip_auth=True for STDIO which has no auth concept)
+        skip_auth, token = _get_auth_context()
+
+        # Deduplicate by key (first wins) and apply authorization checks
+        seen: dict[str, Tool] = {}
+        for tool in tools:
+            if tool.key in seen:
                 continue
-            for tool in result:
-                if self._is_component_enabled(tool) and tool.key not in all_tools:
-                    all_tools[tool.key] = tool
-        return list(all_tools.values())
+            # Check tool-level auth (skip for STDIO)
+            if not skip_auth and tool.auth is not None:
+                ctx = AuthContext(token=token, component=tool)
+                try:
+                    if not run_auth_checks(tool.auth, ctx):
+                        continue
+                except AuthorizationError:
+                    # Treat auth errors as denials in list operations
+                    continue
+            seen[tool.key] = tool
+        return list(seen.values())
 
     async def get_tool(self, name: str) -> Tool:
         """Get an enabled tool by name.
 
-        Queries all providers in parallel to find the tool.
-        First provider wins. Returns only if enabled.
+        Queries providers with full transform chain (provider transforms + server transforms + visibility).
+        Returns only if enabled and authorized.
         """
-        results = await gather(
-            *[p.get_tool(name) for p in self._providers],
-            return_exceptions=True,
-        )
+        tool = await self._source_get_tool(name)
+        if tool is None:
+            raise NotFoundError(f"Unknown tool: {name!r}")
 
-        for i, result in enumerate(results):
-            if isinstance(result, BaseException):
-                if not isinstance(result, NotFoundError):
-                    logger.debug(
-                        f"Error getting tool from {self._providers[i]}: {result}"
-                    )
-                continue
-            if isinstance(result, Tool) and self._is_component_enabled(result):
-                return result
+        # Check tool-level auth (skip for STDIO)
+        skip_auth, token = _get_auth_context()
+        if not skip_auth and tool.auth is not None:
+            ctx = AuthContext(token=token, component=tool)
+            if not run_auth_checks(tool.auth, ctx):
+                raise NotFoundError(f"Unknown tool: {name!r}")
 
-        raise NotFoundError(f"Unknown tool: {name!r}")
+        return tool
 
     async def get_resources(self, *, run_middleware: bool = False) -> list[Resource]:
         """Get all enabled resources from providers.
 
-        Queries all providers in parallel and collects resources.
-        First provider wins for duplicate keys. Filters by server blocklist.
+        Queries all providers via the root provider (which applies provider transforms,
+        server transforms, and visibility filtering). First provider wins for duplicate keys.
 
         Args:
             run_middleware: If True, apply the middleware chain before
@@ -972,57 +1231,55 @@ class FastMCP(Generic[LifespanResultT]):
                     )
                 )
 
-        results = await gather(
-            *[p.list_resources() for p in self._providers],
-            return_exceptions=True,
-        )
+        # Query through full transform chain (provider transforms + server transforms + visibility)
+        resources = await self._source_list_resources()
 
-        all_resources: dict[str, Resource] = {}
-        for i, result in enumerate(results):
-            if isinstance(result, BaseException):
-                provider = self._providers[i]
-                logger.exception(f"Error listing resources from provider {provider}")
-                if fastmcp.settings.mounted_components_raise_on_load_error:
-                    raise result
+        # Get auth context (skip_auth=True for STDIO which has no auth concept)
+        skip_auth, token = _get_auth_context()
+
+        # Deduplicate by key (first wins) and apply authorization checks
+        seen: dict[str, Resource] = {}
+        for resource in resources:
+            if resource.key in seen:
                 continue
-            for resource in result:
-                if (
-                    self._is_component_enabled(resource)
-                    and resource.key not in all_resources
-                ):
-                    all_resources[resource.key] = resource
-        return list(all_resources.values())
+            # Check resource-level auth (skip for STDIO)
+            if not skip_auth and resource.auth is not None:
+                ctx = AuthContext(token=token, component=resource)
+                try:
+                    if not run_auth_checks(resource.auth, ctx):
+                        continue
+                except AuthorizationError:
+                    # Treat auth errors as denials in list operations
+                    continue
+            seen[resource.key] = resource
+        return list(seen.values())
 
     async def get_resource(self, uri: str) -> Resource:
         """Get an enabled resource by URI.
 
-        Queries all providers in parallel to find the resource.
-        First provider wins. Returns only if enabled.
+        Queries providers with full transform chain (provider transforms + server transforms + visibility).
+        Returns only if enabled and authorized.
         """
-        results = await gather(
-            *[p.get_resource(uri) for p in self._providers],
-            return_exceptions=True,
-        )
+        resource = await self._source_get_resource(uri)
+        if resource is None:
+            raise NotFoundError(f"Unknown resource: {uri}")
 
-        for i, result in enumerate(results):
-            if isinstance(result, BaseException):
-                if not isinstance(result, NotFoundError):
-                    logger.debug(
-                        f"Error getting resource from {self._providers[i]}: {result}"
-                    )
-                continue
-            if isinstance(result, Resource) and self._is_component_enabled(result):
-                return result
+        # Check resource-level auth (skip for STDIO)
+        skip_auth, token = _get_auth_context()
+        if not skip_auth and resource.auth is not None:
+            ctx = AuthContext(token=token, component=resource)
+            if not run_auth_checks(resource.auth, ctx):
+                raise NotFoundError(f"Unknown resource: {uri}")
 
-        raise NotFoundError(f"Unknown resource: {uri}")
+        return resource
 
     async def get_resource_templates(
         self, *, run_middleware: bool = False
     ) -> list[ResourceTemplate]:
         """Get all enabled resource templates from providers.
 
-        Queries all providers in parallel and collects templates.
-        First provider wins for duplicate keys. Filters by server blocklist.
+        Queries all providers via the root provider (which applies provider transforms,
+        server transforms, and visibility filtering). First provider wins for duplicate keys.
 
         Args:
             run_middleware: If True, apply the middleware chain before
@@ -1046,59 +1303,53 @@ class FastMCP(Generic[LifespanResultT]):
                     )
                 )
 
-        results = await gather(
-            *[p.list_resource_templates() for p in self._providers],
-            return_exceptions=True,
-        )
+        # Query through full transform chain (provider transforms + server transforms + visibility)
+        templates = await self._source_list_resource_templates()
 
-        all_templates: dict[str, ResourceTemplate] = {}
-        for i, result in enumerate(results):
-            if isinstance(result, BaseException):
-                provider = self._providers[i]
-                logger.exception(
-                    f"Error listing resource templates from provider {provider}"
-                )
-                if fastmcp.settings.mounted_components_raise_on_load_error:
-                    raise result
+        # Get auth context (skip_auth=True for STDIO which has no auth concept)
+        skip_auth, token = _get_auth_context()
+
+        # Deduplicate by key (first wins) and apply authorization checks
+        seen: dict[str, ResourceTemplate] = {}
+        for template in templates:
+            if template.key in seen:
                 continue
-            for template in result:
-                if (
-                    self._is_component_enabled(template)
-                    and template.key not in all_templates
-                ):
-                    all_templates[template.key] = template
-        return list(all_templates.values())
+            # Check template-level auth (skip for STDIO)
+            if not skip_auth and template.auth is not None:
+                ctx = AuthContext(token=token, component=template)
+                try:
+                    if not run_auth_checks(template.auth, ctx):
+                        continue
+                except AuthorizationError:
+                    # Treat auth errors as denials in list operations
+                    continue
+            seen[template.key] = template
+        return list(seen.values())
 
     async def get_resource_template(self, uri: str) -> ResourceTemplate:
         """Get an enabled resource template that matches the given URI.
 
-        Queries all providers in parallel to find the template.
-        First provider wins. Returns only if enabled.
+        Queries providers with full transform chain (provider transforms + server transforms + visibility).
+        Returns only if enabled and authorized.
         """
-        results = await gather(
-            *[p.get_resource_template(uri) for p in self._providers],
-            return_exceptions=True,
-        )
+        template = await self._source_get_resource_template(uri)
+        if template is None:
+            raise NotFoundError(f"Unknown resource template: {uri}")
 
-        for i, result in enumerate(results):
-            if isinstance(result, BaseException):
-                if not isinstance(result, NotFoundError):
-                    logger.debug(
-                        f"Error getting template from {self._providers[i]}: {result}"
-                    )
-                continue
-            if isinstance(result, ResourceTemplate) and self._is_component_enabled(
-                result
-            ):
-                return result
+        # Check template-level auth (skip for STDIO)
+        skip_auth, token = _get_auth_context()
+        if not skip_auth and template.auth is not None:
+            ctx = AuthContext(token=token, component=template)
+            if not run_auth_checks(template.auth, ctx):
+                raise NotFoundError(f"Unknown resource template: {uri}")
 
-        raise NotFoundError(f"Unknown resource template: {uri}")
+        return template
 
     async def get_prompts(self, *, run_middleware: bool = False) -> list[Prompt]:
         """Get all enabled prompts from providers.
 
-        Queries all providers in parallel and collects prompts.
-        First provider wins for duplicate keys. Filters by server blocklist.
+        Queries all providers via the root provider (which applies provider transforms,
+        server transforms, and visibility filtering). First provider wins for duplicate keys.
 
         Args:
             run_middleware: If True, apply the middleware chain before
@@ -1122,54 +1373,54 @@ class FastMCP(Generic[LifespanResultT]):
                     )
                 )
 
-        results = await gather(
-            *[p.list_prompts() for p in self._providers],
-            return_exceptions=True,
-        )
+        # Query through full transform chain (provider transforms + server transforms + visibility)
+        prompts = await self._source_list_prompts()
 
-        all_prompts: dict[str, Prompt] = {}
-        for i, result in enumerate(results):
-            if isinstance(result, BaseException):
-                provider = self._providers[i]
-                logger.exception(f"Error listing prompts from provider {provider}")
-                if fastmcp.settings.mounted_components_raise_on_load_error:
-                    raise result
+        # Get auth context (skip_auth=True for STDIO which has no auth concept)
+        skip_auth, token = _get_auth_context()
+
+        # Deduplicate by key (first wins) and apply authorization checks
+        seen: dict[str, Prompt] = {}
+        for prompt in prompts:
+            if prompt.key in seen:
                 continue
-            for prompt in result:
-                if self._is_component_enabled(prompt) and prompt.key not in all_prompts:
-                    all_prompts[prompt.key] = prompt
-        return list(all_prompts.values())
+            # Check prompt-level auth (skip for STDIO)
+            if not skip_auth and prompt.auth is not None:
+                ctx = AuthContext(token=token, component=prompt)
+                try:
+                    if not run_auth_checks(prompt.auth, ctx):
+                        continue
+                except AuthorizationError:
+                    # Treat auth errors as denials in list operations
+                    continue
+            seen[prompt.key] = prompt
+        return list(seen.values())
 
     async def get_prompt(self, name: str) -> Prompt:
         """Get an enabled prompt by name.
 
-        Queries all providers in parallel to find the prompt.
-        First provider wins. Returns only if enabled.
+        Queries providers with full transform chain (provider transforms + server transforms + visibility).
+        Returns only if enabled and authorized.
         """
-        results = await gather(
-            *[p.get_prompt(name) for p in self._providers],
-            return_exceptions=True,
-        )
+        prompt = await self._source_get_prompt(name)
+        if prompt is None:
+            raise NotFoundError(f"Unknown prompt: {name}")
 
-        for i, result in enumerate(results):
-            if isinstance(result, BaseException):
-                if not isinstance(result, NotFoundError):
-                    logger.debug(
-                        f"Error getting prompt from {self._providers[i]}: {result}"
-                    )
-                continue
-            if isinstance(result, Prompt) and self._is_component_enabled(result):
-                return result
+        # Check prompt-level auth (skip for STDIO)
+        skip_auth, token = _get_auth_context()
+        if not skip_auth and prompt.auth is not None:
+            ctx = AuthContext(token=token, component=prompt)
+            if not run_auth_checks(prompt.auth, ctx):
+                raise NotFoundError(f"Unknown prompt: {name}")
 
-        raise NotFoundError(f"Unknown prompt: {name}")
+        return prompt
 
     async def get_component(
         self, key: str
     ) -> Tool | Resource | ResourceTemplate | Prompt:
         """Get a component by its prefixed key.
 
-        Queries all providers in parallel to find the component.
-        First provider wins.
+        Routes to the appropriate get_* method which applies server-level layers.
 
         Args:
             key: The prefixed key (e.g., "tool:name", "resource:uri", "template:uri").
@@ -1180,21 +1431,15 @@ class FastMCP(Generic[LifespanResultT]):
         Raises:
             NotFoundError: If no component is found with the given key.
         """
-        results = await gather(
-            *[p.get_component(key) for p in self._providers],
-            return_exceptions=True,
-        )
-
-        for i, result in enumerate(results):
-            if isinstance(result, BaseException):
-                if not isinstance(result, NotFoundError):
-                    logger.debug(
-                        f"Error getting component from {self._providers[i]}: {result}"
-                    )
-                continue
-            if isinstance(result, FastMCPComponent):
-                return result
-
+        # Parse key and delegate to specific methods which apply layers
+        if key.startswith("tool:"):
+            return await self.get_tool(key[5:])
+        elif key.startswith("resource:"):
+            return await self.get_resource(key[9:])
+        elif key.startswith("template:"):
+            return await self.get_resource_template(key[9:])
+        elif key.startswith("prompt:"):
+            return await self.get_prompt(key[7:])
         raise NotFoundError(f"Unknown component: {key}")
 
     @overload
@@ -1752,14 +1997,14 @@ class FastMCP(Generic[LifespanResultT]):
         except NotFoundError:
             raise
 
-    def add_tool(self, tool: Tool) -> Tool:
+    def add_tool(self, tool: Tool | Callable[..., Any]) -> Tool:
         """Add a tool to the server.
 
         The tool function can optionally request a Context object by adding a parameter
         with the Context type annotation. See the @tool decorator for examples.
 
         Args:
-            tool: The Tool instance to register
+            tool: The Tool instance or @tool-decorated function to register
 
         Returns:
             The tool instance that was added to the server.
@@ -1780,16 +2025,6 @@ class FastMCP(Generic[LifespanResultT]):
         except KeyError:
             raise NotFoundError(f"Tool {name!r} not found") from None
 
-    def add_tool_transformation(
-        self, tool_name: str, transformation: ToolTransformConfig
-    ) -> None:
-        """Add a tool transformation."""
-        self._local_provider.add_tool_transformation(tool_name, transformation)
-
-    def remove_tool_transformation(self, tool_name: str) -> None:
-        """Remove a tool transformation."""
-        self._local_provider.remove_tool_transformation(tool_name)
-
     @overload
     def tool(
         self,
@@ -1805,6 +2040,7 @@ class FastMCP(Generic[LifespanResultT]):
         exclude_args: list[str] | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> FunctionTool: ...
 
     @overload
@@ -1822,6 +2058,7 @@ class FastMCP(Generic[LifespanResultT]):
         exclude_args: list[str] | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> Callable[[AnyFunction], FunctionTool]: ...
 
     def tool(
@@ -1838,6 +2075,7 @@ class FastMCP(Generic[LifespanResultT]):
         exclude_args: list[str] | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> (
         Callable[[AnyFunction], FunctionTool]
         | FunctionTool
@@ -1905,15 +2143,18 @@ class FastMCP(Generic[LifespanResultT]):
             meta=meta,
             task=task if task is not None else self._support_tasks_by_default,
             serializer=self._tool_serializer,
+            auth=auth,
         )
 
         return result
 
-    def add_resource(self, resource: Resource) -> Resource:
+    def add_resource(
+        self, resource: Resource | Callable[..., Any]
+    ) -> Resource | ResourceTemplate:
         """Add a resource to the server.
 
         Args:
-            resource: A Resource instance to add
+            resource: A Resource instance or @resource-decorated function to add
 
         Returns:
             The resource instance that was added to the server.
@@ -1933,27 +2174,27 @@ class FastMCP(Generic[LifespanResultT]):
 
     async def notify_resource_updated(self, uri: str) -> None:
         """Notify all subscribers that a resource has been updated.
-        
+
         Call this method when the content of a resource changes to notify
         subscribed clients. Clients can then decide whether to fetch the
         updated content via resources/read.
-        
+
         This follows the MCP decoupled pub/sub model: notifications are sent
         when data changes, not when resources are read.
-        
+
         Args:
             uri: The URI of the resource that was updated
-            
+
         Example:
             ```python
             server = FastMCP("my-server")
-            
+
             sensor_data = {"temperature": 20}
-            
+
             @server.resource("resource://sensors/temp")
             def get_temperature() -> str:
                 return f"Temperature: {sensor_data['temperature']}°C"
-            
+
             # When data changes, notify subscribers
             async def update_temperature(new_temp: int):
                 sensor_data['temperature'] = new_temp
@@ -1975,7 +2216,8 @@ class FastMCP(Generic[LifespanResultT]):
         annotations: Annotations | dict[str, Any] | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
-    ) -> Callable[[AnyFunction], Resource | ResourceTemplate]:
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
+    ) -> Callable[[AnyFunction], Resource | ResourceTemplate | AnyFunction]:
         """Decorator to register a function as a resource.
 
         The function will be called when the resource is read to generate its content.
@@ -2039,18 +2281,19 @@ class FastMCP(Generic[LifespanResultT]):
             annotations=annotations,
             meta=meta,
             task=task if task is not None else self._support_tasks_by_default,
+            auth=auth,
         )
 
-        def decorator(fn: AnyFunction) -> Resource | ResourceTemplate:
+        def decorator(fn: AnyFunction) -> Resource | ResourceTemplate | AnyFunction:
             return inner_decorator(fn)
 
         return decorator
 
-    def add_prompt(self, prompt: Prompt) -> Prompt:
+    def add_prompt(self, prompt: Prompt | Callable[..., Any]) -> Prompt:
         """Add a prompt to the server.
 
         Args:
-            prompt: A Prompt instance to add
+            prompt: A Prompt instance or @prompt-decorated function to add
 
         Returns:
             The prompt instance that was added to the server.
@@ -2069,6 +2312,7 @@ class FastMCP(Generic[LifespanResultT]):
         tags: set[str] | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> FunctionPrompt: ...
 
     @overload
@@ -2083,6 +2327,7 @@ class FastMCP(Generic[LifespanResultT]):
         tags: set[str] | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> Callable[[AnyFunction], FunctionPrompt]: ...
 
     def prompt(
@@ -2096,6 +2341,7 @@ class FastMCP(Generic[LifespanResultT]):
         tags: set[str] | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> (
         Callable[[AnyFunction], FunctionPrompt]
         | FunctionPrompt
@@ -2179,6 +2425,7 @@ class FastMCP(Generic[LifespanResultT]):
             tags=tags,
             meta=meta,
             task=task if task is not None else self._support_tasks_by_default,
+            auth=auth,
         )
 
     async def run_stdio_async(
@@ -2448,12 +2695,20 @@ class FastMCP(Generic[LifespanResultT]):
                 if not isinstance(server, FastMCPProxy):
                     server = FastMCP.as_proxy(server)
 
-        # Create provider with optional transformations
+        # Create provider with optional transforms
         provider: Provider = FastMCPProvider(server)
-        if namespace or tool_names:
-            provider = provider.with_transforms(
-                namespace=namespace, tool_renames=tool_names
-            )
+        if namespace:
+            provider.add_transform(Namespace(namespace))
+        if tool_names:
+            # Tool renames are implemented as a ToolTransform
+            # Keys must use the namespaced names (after Namespace transform)
+            transforms = {
+                (
+                    f"{namespace}_{old_name}" if namespace else old_name
+                ): ToolTransformConfig(name=new_name)
+                for old_name, new_name in tool_names.items()
+            }
+            provider.add_transform(ToolTransform(transforms))
         self._providers.append(provider)
 
     async def import_server(
@@ -2589,7 +2844,7 @@ class FastMCP(Generic[LifespanResultT]):
         """
         from .providers.openapi import OpenAPIProvider
 
-        provider = OpenAPIProvider(
+        provider: Provider = OpenAPIProvider(
             openapi_spec=openapi_spec,
             client=client,
             route_maps=route_maps,
@@ -2646,7 +2901,7 @@ class FastMCP(Generic[LifespanResultT]):
 
         server_name = name or app.title
 
-        provider = OpenAPIProvider(
+        provider: Provider = OpenAPIProvider(
             openapi_spec=app.openapi(),
             client=client,
             route_maps=route_maps,
@@ -2759,4 +3014,7 @@ def create_proxy(
     )
 
     client_factory = _create_client_factory(target)
-    return FastMCPProxy(client_factory=client_factory, **settings)
+    return FastMCPProxy(
+        client_factory=client_factory,
+        **settings,
+    )

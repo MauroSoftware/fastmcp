@@ -29,6 +29,7 @@ from starlette.requests import Request
 from fastmcp.exceptions import FastMCPError
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.http import _current_http_request
+from fastmcp.utilities.async_utils import call_sync_fn_in_threadpool
 from fastmcp.utilities.types import find_kwarg_by_type, is_class_member_of_type
 
 if TYPE_CHECKING:
@@ -230,7 +231,7 @@ def transform_context_annotations(fn: Callable[..., Any]) -> Callable[..., Any]:
     # inspect.signature(bound_method) automatically removes the first param
     if inspect.ismethod(fn):
         # Get the original __func__ signature which includes 'self'
-        func_sig = inspect.signature(fn.__func__)  # type: ignore[union-attr]
+        func_sig = inspect.signature(fn.__func__)
         # Insert 'self' at the beginning of our new params
         self_param = next(iter(func_sig.parameters.values()))  # Should be 'self'
         new_sig = func_sig.replace(parameters=[self_param, *new_params])
@@ -261,8 +262,8 @@ def _clear_signature_caches(fn: Callable[..., Any]) -> None:
 
     # Also clear for __func__ if it's a method
     if inspect.ismethod(fn):
-        _signature_cache.pop(fn.__func__, None)  # type: ignore[union-attr]
-        _parameter_cache.pop(fn.__func__, None)  # type: ignore[union-attr]
+        _signature_cache.pop(fn.__func__, None)
+        _parameter_cache.pop(fn.__func__, None)
 
     # Try to clear docket caches if docket is installed
     if is_docket_available():
@@ -273,8 +274,8 @@ def _clear_signature_caches(fn: Callable[..., Any]) -> None:
             docket_sig_cache.pop(fn, None)
             docket_param_cache.pop(fn, None)
             if inspect.ismethod(fn):
-                docket_sig_cache.pop(fn.__func__, None)  # type: ignore[union-attr]
-                docket_param_cache.pop(fn.__func__, None)  # type: ignore[union-attr]
+                docket_sig_cache.pop(fn.__func__, None)
+                docket_param_cache.pop(fn.__func__, None)
         except (ImportError, AttributeError):
             pass  # Cache access not available in this docket version
 
@@ -417,7 +418,7 @@ def get_access_token() -> AccessToken | None:
             # Optional fields
             expires_at=access_token_as_dict.get("expires_at"),
             resource=access_token_as_dict.get("resource"),
-            claims=access_token_as_dict.get("claims"),
+            claims=access_token_as_dict.get("claims") or {},
         )
     except Exception as e:
         raise TypeError(
@@ -471,12 +472,19 @@ def without_injected_parameters(fn: Callable[..., Any]) -> Callable[..., Any]:
     new_sig = inspect.Signature(user_params)
 
     # Create async wrapper that handles dependency resolution
+    fn_is_async = inspect.iscoroutinefunction(fn)
+
     async def wrapper(**user_kwargs: Any) -> Any:
         async with resolve_dependencies(fn, user_kwargs) as resolved_kwargs:
-            result = fn(**resolved_kwargs)
-            if inspect.isawaitable(result):
-                result = await result
-            return result
+            if fn_is_async:
+                return await fn(**resolved_kwargs)
+            else:
+                # Run sync functions in threadpool to avoid blocking the event loop
+                result = await call_sync_fn_in_threadpool(fn, **resolved_kwargs)
+                # Handle sync wrappers that return awaitables (e.g., partial(async_fn))
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
 
     # Set wrapper metadata (only parameter annotations, not return type)
     wrapper.__signature__ = new_sig  # type: ignore[attr-defined]

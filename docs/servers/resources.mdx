@@ -132,6 +132,10 @@ def get_application_status() -> str:
 </ParamField>
 </Card>
 
+#### Using with Methods
+
+For decorating instance or class methods, use the standalone `@resource` decorator and register the bound method. See [Tools: Using with Methods](/servers/tools#using-with-methods) for the pattern.
+
 ### Return Values
 
 Resource functions must return one of three types:
@@ -266,7 +270,9 @@ For full documentation on the Context object and all its capabilities, see the [
 
 ### Async Resources
 
-Use `async def` for resource functions that perform I/O operations (e.g., reading from a database or network) to avoid blocking the server.
+FastMCP supports both `async def` and regular `def` resource functions. Synchronous functions automatically run in a threadpool to avoid blocking the event loop.
+
+For I/O-bound operations, async functions are more efficient:
 
 ```python
 import aiofiles

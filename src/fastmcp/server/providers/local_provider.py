@@ -34,18 +34,15 @@ import mcp.types
 from mcp.types import Annotations, AnyFunction, ToolAnnotations
 
 import fastmcp
-from fastmcp.prompts.prompt import FunctionPrompt, Prompt
-from fastmcp.prompts.prompt import prompt as standalone_prompt
+from fastmcp.prompts.function_prompt import FunctionPrompt
+from fastmcp.prompts.prompt import Prompt
+from fastmcp.resources.function_resource import resource as standalone_resource
 from fastmcp.resources.resource import Resource
-from fastmcp.resources.resource import resource as standalone_resource
 from fastmcp.resources.template import ResourceTemplate
 from fastmcp.server.providers.base import Provider
 from fastmcp.server.tasks.config import TaskConfig
-from fastmcp.tools.tool import FunctionTool, Tool
-from fastmcp.tools.tool_transform import (
-    ToolTransformConfig,
-    apply_transformations_to_tools,
-)
+from fastmcp.tools.function_tool import FunctionTool
+from fastmcp.tools.tool import AuthCheckCallable, Tool
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.types import NotSet, NotSetT
@@ -112,7 +109,6 @@ class LocalProvider(Provider):
         self._on_duplicate = on_duplicate
         # Unified component storage - keyed by prefixed key (e.g., "tool:name", "resource:uri")
         self._components: dict[str, FastMCPComponent] = {}
-        self._tool_transformations: dict[str, ToolTransformConfig] = {}
 
     def _send_list_changed_notification(self, component: FastMCPComponent) -> None:
         """Send a list changed notification for the component type."""
@@ -183,16 +179,95 @@ class LocalProvider(Provider):
         """
         return self._components.get(key)
 
-    def add_tool(self, tool: Tool) -> Tool:
-        """Add a tool to this provider's storage."""
+    def add_tool(self, tool: Tool | Callable[..., Any]) -> Tool:
+        """Add a tool to this provider's storage.
+
+        Accepts either a Tool object or a decorated function with __fastmcp__ metadata.
+        """
+        if not isinstance(tool, Tool):
+            from fastmcp.decorators import get_fastmcp_meta
+            from fastmcp.tools.function_tool import ToolMeta
+
+            meta = get_fastmcp_meta(tool)
+            if meta is not None and isinstance(meta, ToolMeta):
+                resolved_task = meta.task if meta.task is not None else False
+                tool = Tool.from_function(
+                    tool,
+                    name=meta.name,
+                    title=meta.title,
+                    description=meta.description,
+                    icons=meta.icons,
+                    tags=meta.tags,
+                    output_schema=meta.output_schema,
+                    annotations=meta.annotations,
+                    meta=meta.meta,
+                    task=resolved_task,
+                    exclude_args=meta.exclude_args,
+                    serializer=meta.serializer,
+                    auth=meta.auth,
+                )
+            else:
+                tool = Tool.from_function(tool)
         return self._add_component(tool)
 
     def remove_tool(self, name: str) -> None:
         """Remove a tool from this provider's storage."""
         self._remove_component(Tool.make_key(name))
 
-    def add_resource(self, resource: Resource) -> Resource:
-        """Add a resource to this provider's storage."""
+    def add_resource(
+        self, resource: Resource | ResourceTemplate | Callable[..., Any]
+    ) -> Resource | ResourceTemplate:
+        """Add a resource to this provider's storage.
+
+        Accepts either a Resource/ResourceTemplate object or a decorated function with __fastmcp__ metadata.
+        """
+        if not isinstance(resource, (Resource, ResourceTemplate)):
+            from fastmcp.decorators import get_fastmcp_meta
+            from fastmcp.resources.function_resource import ResourceMeta
+            from fastmcp.server.dependencies import without_injected_parameters
+
+            meta = get_fastmcp_meta(resource)
+            if meta is not None and isinstance(meta, ResourceMeta):
+                resolved_task = meta.task if meta.task is not None else False
+                has_uri_params = "{" in meta.uri and "}" in meta.uri
+                wrapper_fn = without_injected_parameters(resource)
+                has_func_params = bool(inspect.signature(wrapper_fn).parameters)
+
+                if has_uri_params or has_func_params:
+                    resource = ResourceTemplate.from_function(
+                        fn=resource,
+                        uri_template=meta.uri,
+                        name=meta.name,
+                        title=meta.title,
+                        description=meta.description,
+                        icons=meta.icons,
+                        mime_type=meta.mime_type,
+                        tags=meta.tags,
+                        annotations=meta.annotations,
+                        meta=meta.meta,
+                        task=resolved_task,
+                        auth=meta.auth,
+                    )
+                else:
+                    resource = Resource.from_function(
+                        fn=resource,
+                        uri=meta.uri,
+                        name=meta.name,
+                        title=meta.title,
+                        description=meta.description,
+                        icons=meta.icons,
+                        mime_type=meta.mime_type,
+                        tags=meta.tags,
+                        annotations=meta.annotations,
+                        meta=meta.meta,
+                        task=resolved_task,
+                        auth=meta.auth,
+                    )
+            else:
+                raise TypeError(
+                    f"Expected Resource, ResourceTemplate, or @resource-decorated function, got {type(resource).__name__}. "
+                    "Use @resource('uri') decorator or pass a Resource/ResourceTemplate instance."
+                )
         return self._add_component(resource)
 
     def remove_resource(self, uri: str) -> None:
@@ -207,8 +282,34 @@ class LocalProvider(Provider):
         """Remove a resource template from this provider's storage."""
         self._remove_component(ResourceTemplate.make_key(uri_template))
 
-    def add_prompt(self, prompt: Prompt) -> Prompt:
-        """Add a prompt to this provider's storage."""
+    def add_prompt(self, prompt: Prompt | Callable[..., Any]) -> Prompt:
+        """Add a prompt to this provider's storage.
+
+        Accepts either a Prompt object or a decorated function with __fastmcp__ metadata.
+        """
+        if not isinstance(prompt, Prompt):
+            from fastmcp.decorators import get_fastmcp_meta
+            from fastmcp.prompts.function_prompt import PromptMeta
+
+            meta = get_fastmcp_meta(prompt)
+            if meta is not None and isinstance(meta, PromptMeta):
+                resolved_task = meta.task if meta.task is not None else False
+                prompt = Prompt.from_function(
+                    prompt,
+                    name=meta.name,
+                    title=meta.title,
+                    description=meta.description,
+                    icons=meta.icons,
+                    tags=meta.tags,
+                    meta=meta.meta,
+                    task=resolved_task,
+                    auth=meta.auth,
+                )
+            else:
+                raise TypeError(
+                    f"Expected Prompt or @prompt-decorated function, got {type(prompt).__name__}. "
+                    "Use @prompt decorator or pass a Prompt instance."
+                )
         return self._add_component(prompt)
 
     def remove_prompt(self, name: str) -> None:
@@ -216,57 +317,27 @@ class LocalProvider(Provider):
         self._remove_component(Prompt.make_key(name))
 
     # =========================================================================
-    # Tool transformation methods
-    # =========================================================================
-
-    def add_tool_transformation(
-        self, tool_name: str, transformation: ToolTransformConfig
-    ) -> None:
-        """Add a tool transformation.
-
-        Args:
-            tool_name: The name of the tool to transform.
-            transformation: The transformation configuration.
-        """
-        self._tool_transformations[tool_name] = transformation
-
-    def get_tool_transformation(self, tool_name: str) -> ToolTransformConfig | None:
-        """Get a tool transformation.
-
-        Args:
-            tool_name: The name of the tool.
-
-        Returns:
-            The transformation config, or None if not found.
-        """
-        return self._tool_transformations.get(tool_name)
-
-    def remove_tool_transformation(self, tool_name: str) -> None:
-        """Remove a tool transformation.
-
-        Args:
-            tool_name: The name of the tool.
-        """
-        if tool_name in self._tool_transformations:
-            del self._tool_transformations[tool_name]
-
-    # =========================================================================
     # Provider interface implementation
     # =========================================================================
 
     async def list_tools(self) -> Sequence[Tool]:
-        """Return all visible tools with transformations applied."""
-        tools = {k: v for k, v in self._components.items() if isinstance(v, Tool)}
-        transformed = apply_transformations_to_tools(
-            tools=tools,
-            transformations=self._tool_transformations,
-        )
-        return [t for t in transformed.values() if self._is_component_enabled(t)]
+        """Return all visible tools."""
+        return [
+            v
+            for v in self._components.values()
+            if isinstance(v, Tool) and self._is_component_enabled(v)
+        ]
 
     async def get_tool(self, name: str) -> Tool | None:
-        """Get a tool by name, with transformations applied."""
-        tools = await self.list_tools()
-        return next((t for t in tools if t.name == name), None)
+        """Get a tool by name."""
+        tool = self._get_component(Tool.make_key(name))
+        if (
+            tool is not None
+            and isinstance(tool, Tool)
+            and self._is_component_enabled(tool)
+        ):
+            return tool
+        return None
 
     async def list_resources(self) -> Sequence[Resource]:
         """Return all visible resources."""
@@ -363,6 +434,7 @@ class LocalProvider(Provider):
         enabled: bool = True,
         task: bool | TaskConfig | None = None,
         serializer: ToolResultSerializerType | None = None,  # Deprecated
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> FunctionTool: ...
 
     @overload
@@ -382,6 +454,7 @@ class LocalProvider(Provider):
         enabled: bool = True,
         task: bool | TaskConfig | None = None,
         serializer: ToolResultSerializerType | None = None,  # Deprecated
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> Callable[[AnyFunction], FunctionTool]: ...
 
     # NOTE: This method mirrors fastmcp.tools.tool() but adds registration,
@@ -404,6 +477,7 @@ class LocalProvider(Provider):
         enabled: bool = True,
         task: bool | TaskConfig | None = None,
         serializer: ToolResultSerializerType | None = None,  # Deprecated
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> (
         Callable[[AnyFunction], FunctionTool]
         | FunctionTool
@@ -462,46 +536,81 @@ class LocalProvider(Provider):
 
         if isinstance(name_or_fn, classmethod):
             raise TypeError(
-                inspect.cleandoc(
-                    """
-                    To decorate a classmethod, first define the method and then call
-                    tool() directly on the method instead of using it as a
-                    decorator. See https://gofastmcp.com/patterns/decorating-methods
-                    for examples and more information.
-                    """
+                "To decorate a classmethod, use @classmethod above @tool. "
+                "See https://gofastmcp.com/servers/tools#using-with-methods"
+            )
+
+        def decorate_and_register(
+            fn: AnyFunction, tool_name: str | None
+        ) -> FunctionTool | AnyFunction:
+            # Check for unbound method
+            try:
+                params = list(inspect.signature(fn).parameters.keys())
+            except (ValueError, TypeError):
+                params = []
+            if params and params[0] in ("self", "cls"):
+                fn_name = getattr(fn, "__name__", "function")
+                raise TypeError(
+                    f"The function '{fn_name}' has '{params[0]}' as its first parameter. "
+                    f"Use the standalone @tool decorator and register the bound method:\n\n"
+                    f"    from fastmcp.tools import tool\n\n"
+                    f"    class MyClass:\n"
+                    f"        @tool\n"
+                    f"        def {fn_name}(...):\n"
+                    f"            ...\n\n"
+                    f"    obj = MyClass()\n"
+                    f"    mcp.add_tool(obj.{fn_name})\n\n"
+                    f"See https://gofastmcp.com/servers/tools#using-with-methods"
                 )
-            )
 
-        # Determine the actual name and function based on the calling pattern
+            resolved_task: bool | TaskConfig = task if task is not None else False
+
+            if fastmcp.settings.decorator_mode == "object":
+                tool_obj = Tool.from_function(
+                    fn,
+                    name=tool_name,
+                    title=title,
+                    description=description,
+                    icons=icons,
+                    tags=tags,
+                    output_schema=output_schema,
+                    annotations=annotations,
+                    exclude_args=exclude_args,
+                    meta=meta,
+                    serializer=serializer,
+                    task=resolved_task,
+                    auth=auth,
+                )
+                self._add_component(tool_obj)
+                if not enabled:
+                    self.disable(keys=[tool_obj.key])
+                return tool_obj
+            else:
+                from fastmcp.tools.function_tool import ToolMeta
+
+                metadata = ToolMeta(
+                    name=tool_name,
+                    title=title,
+                    description=description,
+                    icons=icons,
+                    tags=tags,
+                    output_schema=output_schema,
+                    annotations=annotations,
+                    meta=meta,
+                    task=task,
+                    exclude_args=exclude_args,
+                    serializer=serializer,
+                    auth=auth,
+                )
+                target = fn.__func__ if hasattr(fn, "__func__") else fn
+                target.__fastmcp__ = metadata  # type: ignore[attr-defined]
+                tool_obj = self.add_tool(fn)
+                if not enabled:
+                    self.disable(keys=[tool_obj.key])
+                return fn
+
         if inspect.isroutine(name_or_fn):
-            # Case 1: @tool (without parens) - function passed directly
-            # Case 2: direct call like tool(fn, name="something")
-            fn = name_or_fn
-            tool_name = name  # Use keyword name if provided, otherwise None
-
-            # Resolve task parameter - default to False for standalone usage
-            supports_task: bool | TaskConfig = task if task is not None else False
-
-            # Register the tool immediately and return the tool object
-            tool_obj = Tool.from_function(
-                fn,
-                name=tool_name,
-                title=title,
-                description=description,
-                icons=icons,
-                tags=tags,
-                output_schema=output_schema,
-                annotations=annotations,
-                exclude_args=exclude_args,
-                meta=meta,
-                serializer=serializer,
-                task=supports_task,
-            )
-            self.add_tool(tool_obj)
-            # If disabled, add to blocklist
-            if not enabled:
-                self.disable(keys=[tool_obj.key])
-            return tool_obj
+            return decorate_and_register(name_or_fn, name)
 
         elif isinstance(name_or_fn, str):
             # Case 3: @tool("custom_name") - name passed as first argument
@@ -534,6 +643,7 @@ class LocalProvider(Provider):
             enabled=enabled,
             task=task,
             serializer=serializer,
+            auth=auth,
         )
 
     def resource(
@@ -550,7 +660,8 @@ class LocalProvider(Provider):
         annotations: Annotations | dict[str, Any] | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
-    ) -> Callable[[AnyFunction], Resource | ResourceTemplate]:
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
+    ) -> Callable[[AnyFunction], Resource | ResourceTemplate | AnyFunction]:
         """Decorator to register a function as a resource.
 
         If the URI contains parameters (e.g. "resource://{param}") or the function
@@ -568,6 +679,7 @@ class LocalProvider(Provider):
             annotations: Optional annotations about the resource's behavior
             meta: Optional meta information about the resource
             task: Optional task configuration for background execution
+            auth: Optional authorization checks for the resource
 
         Returns:
             A decorator function.
@@ -585,35 +697,85 @@ class LocalProvider(Provider):
                 return f"Weather for {city}"
             ```
         """
-        # Resolve task parameter - default to False for standalone usage
-        supports_task: bool | TaskConfig = task if task is not None else False
+        if isinstance(annotations, dict):
+            annotations = Annotations(**annotations)
 
-        # Get the standalone decorator
-        create_resource = standalone_resource(
-            uri,
-            name=name,
-            title=title,
-            description=description,
-            icons=icons,
-            mime_type=mime_type,
-            tags=tags,
-            annotations=annotations,
-            meta=meta,
-            task=supports_task,
-        )
+        if inspect.isroutine(uri):
+            raise TypeError(
+                "The @resource decorator was used incorrectly. "
+                "It requires a URI as the first argument. "
+                "Use @resource('uri') instead of @resource"
+            )
 
-        def decorator(fn: AnyFunction) -> Resource | ResourceTemplate:
-            # Delegate to standalone decorator for object creation
-            obj = create_resource(fn)
-            # Register with this provider
-            if isinstance(obj, ResourceTemplate):
-                self.add_template(obj)
+        resolved_task: bool | TaskConfig = task if task is not None else False
+
+        def decorator(fn: AnyFunction) -> Resource | ResourceTemplate | AnyFunction:
+            # Check for unbound method
+            try:
+                params = list(inspect.signature(fn).parameters.keys())
+            except (ValueError, TypeError):
+                params = []
+            if params and params[0] in ("self", "cls"):
+                fn_name = getattr(fn, "__name__", "function")
+                raise TypeError(
+                    f"The function '{fn_name}' has '{params[0]}' as its first parameter. "
+                    f"Use the standalone @resource decorator and register the bound method:\n\n"
+                    f"    from fastmcp.resources import resource\n\n"
+                    f"    class MyClass:\n"
+                    f"        @resource('{uri}')\n"
+                    f"        def {fn_name}(...):\n"
+                    f"            ...\n\n"
+                    f"    obj = MyClass()\n"
+                    f"    mcp.add_resource(obj.{fn_name})\n\n"
+                    f"See https://gofastmcp.com/servers/resources#using-with-methods"
+                )
+
+            if fastmcp.settings.decorator_mode == "object":
+                create_resource = standalone_resource(
+                    uri,
+                    name=name,
+                    title=title,
+                    description=description,
+                    icons=icons,
+                    mime_type=mime_type,
+                    tags=tags,
+                    annotations=annotations,
+                    meta=meta,
+                    task=resolved_task,
+                    auth=auth,
+                )
+                obj = create_resource(fn)
+                # In legacy mode, standalone_resource always returns a component
+                assert isinstance(obj, (Resource, ResourceTemplate))
+                if isinstance(obj, ResourceTemplate):
+                    self.add_template(obj)
+                else:
+                    self.add_resource(obj)
+                if not enabled:
+                    self.disable(keys=[obj.key])
+                return obj
             else:
-                self.add_resource(obj)
-            # Handle enabled flag
-            if not enabled:
-                self.disable(keys=[obj.key])
-            return obj
+                from fastmcp.resources.function_resource import ResourceMeta
+
+                metadata = ResourceMeta(
+                    uri=uri,
+                    name=name,
+                    title=title,
+                    description=description,
+                    icons=icons,
+                    tags=tags,
+                    mime_type=mime_type,
+                    annotations=annotations,
+                    meta=meta,
+                    task=task,
+                    auth=auth,
+                )
+                target = fn.__func__ if hasattr(fn, "__func__") else fn
+                target.__fastmcp__ = metadata  # type: ignore[attr-defined]
+                obj = self.add_resource(fn)
+                if not enabled:
+                    self.disable(keys=[obj.key])
+                return fn
 
         return decorator
 
@@ -630,6 +792,7 @@ class LocalProvider(Provider):
         enabled: bool = True,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> FunctionPrompt: ...
 
     @overload
@@ -645,6 +808,7 @@ class LocalProvider(Provider):
         enabled: bool = True,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> Callable[[AnyFunction], FunctionPrompt]: ...
 
     def prompt(
@@ -659,6 +823,7 @@ class LocalProvider(Provider):
         enabled: bool = True,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> (
         Callable[[AnyFunction], FunctionPrompt]
         | FunctionPrompt
@@ -683,6 +848,7 @@ class LocalProvider(Provider):
             enabled: Whether the prompt is enabled (default True). If False, adds to blocklist.
             meta: Optional meta information about the prompt
             task: Optional task configuration for background execution
+            auth: Optional authorization checks for the prompt
 
         Returns:
             The registered FunctionPrompt or a decorator function.
@@ -700,39 +866,97 @@ class LocalProvider(Provider):
                 return [{"role": "user", "content": data}]
             ```
         """
+        if isinstance(name_or_fn, classmethod):
+            raise TypeError(
+                "To decorate a classmethod, use @classmethod above @prompt. "
+                "See https://gofastmcp.com/servers/prompts#using-with-methods"
+            )
 
-        def register(prompt_obj: FunctionPrompt) -> FunctionPrompt:
-            """Register the prompt and handle enabled flag."""
-            self.add_prompt(prompt_obj)
-            if not enabled:
-                self.disable(keys=[prompt_obj.key])
-            return prompt_obj
+        def decorate_and_register(
+            fn: AnyFunction, prompt_name: str | None
+        ) -> FunctionPrompt | AnyFunction:
+            # Check for unbound method
+            try:
+                params = list(inspect.signature(fn).parameters.keys())
+            except (ValueError, TypeError):
+                params = []
+            if params and params[0] in ("self", "cls"):
+                fn_name = getattr(fn, "__name__", "function")
+                raise TypeError(
+                    f"The function '{fn_name}' has '{params[0]}' as its first parameter. "
+                    f"Use the standalone @prompt decorator and register the bound method:\n\n"
+                    f"    from fastmcp.prompts import prompt\n\n"
+                    f"    class MyClass:\n"
+                    f"        @prompt\n"
+                    f"        def {fn_name}(...):\n"
+                    f"            ...\n\n"
+                    f"    obj = MyClass()\n"
+                    f"    mcp.add_prompt(obj.{fn_name})\n\n"
+                    f"See https://gofastmcp.com/servers/prompts#using-with-methods"
+                )
 
-        # Resolve task parameter - default to False for standalone usage
-        supports_task: bool | TaskConfig = task if task is not None else False
+            resolved_task: bool | TaskConfig = task if task is not None else False
 
-        # Delegate to standalone decorator for object creation
-        # Type ignore: standalone_prompt has overloads for specific types, but we pass
-        # through the union type. Runtime behavior is correct.
-        result = standalone_prompt(
-            name_or_fn,  # type: ignore[arg-type]
-            name=name,
+            if fastmcp.settings.decorator_mode == "object":
+                prompt_obj = Prompt.from_function(
+                    fn,
+                    name=prompt_name,
+                    title=title,
+                    description=description,
+                    icons=icons,
+                    tags=tags,
+                    meta=meta,
+                    task=resolved_task,
+                    auth=auth,
+                )
+                self._add_component(prompt_obj)
+                if not enabled:
+                    self.disable(keys=[prompt_obj.key])
+                return prompt_obj
+            else:
+                from fastmcp.prompts.function_prompt import PromptMeta
+
+                metadata = PromptMeta(
+                    name=prompt_name,
+                    title=title,
+                    description=description,
+                    icons=icons,
+                    tags=tags,
+                    meta=meta,
+                    task=task,
+                    auth=auth,
+                )
+                target = fn.__func__ if hasattr(fn, "__func__") else fn
+                target.__fastmcp__ = metadata  # type: ignore[attr-defined]
+                prompt_obj = self.add_prompt(fn)
+                if not enabled:
+                    self.disable(keys=[prompt_obj.key])
+                return fn
+
+        if inspect.isroutine(name_or_fn):
+            return decorate_and_register(name_or_fn, name)
+
+        elif isinstance(name_or_fn, str):
+            if name is not None:
+                raise TypeError(
+                    f"Cannot specify both a name as first argument and as keyword argument. "
+                    f"Use either @prompt('{name_or_fn}') or @prompt(name='{name}'), not both."
+                )
+            prompt_name = name_or_fn
+        elif name_or_fn is None:
+            prompt_name = name
+        else:
+            raise TypeError(f"Invalid first argument: {type(name_or_fn)}")
+
+        return partial(
+            self.prompt,
+            name=prompt_name,
             title=title,
             description=description,
             icons=icons,
             tags=tags,
             meta=meta,
-            task=supports_task,
+            enabled=enabled,
+            task=task,
+            auth=auth,
         )
-
-        # If standalone returned a FunctionPrompt directly (@prompt without parens),
-        # register it and return
-        if isinstance(result, FunctionPrompt):
-            return register(result)
-
-        # Otherwise, standalone returned a decorator/partial - wrap it to register after creation
-        def decorator(fn: AnyFunction) -> FunctionPrompt:
-            prompt_obj = result(fn)
-            return register(prompt_obj)
-
-        return decorator

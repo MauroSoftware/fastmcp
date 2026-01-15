@@ -4,7 +4,7 @@ from pydantic import AnyUrl, BaseModel
 
 from fastmcp import Client, FastMCP
 from fastmcp.resources import Resource, ResourceContent, ResourceResult
-from fastmcp.resources.resource import FunctionResource
+from fastmcp.resources.function_resource import FunctionResource
 
 
 class TestResourceValidation:
@@ -93,7 +93,7 @@ class TestResourceValidation:
         class ConcreteResource(Resource):
             pass
 
-        resource = ConcreteResource(uri=AnyUrl("test://test"), name="test")  # type: ignore
+        resource = ConcreteResource(uri=AnyUrl("test://test"), name="test")
         with pytest.raises(NotImplementedError, match="Subclasses must implement read"):
             await resource.read()
 

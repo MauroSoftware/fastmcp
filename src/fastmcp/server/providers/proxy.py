@@ -43,10 +43,6 @@ from fastmcp.server.providers.base import Provider
 from fastmcp.server.server import FastMCP
 from fastmcp.server.tasks.config import TaskConfig
 from fastmcp.tools.tool import Tool, ToolResult
-from fastmcp.tools.tool_transform import (
-    ToolTransformConfig,
-    apply_transformations_to_tools,
-)
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.logging import get_logger
 
@@ -90,7 +86,7 @@ class ProxyTool(Tool):
             # First time name is being changed, preserve original for backend calls
             update = {**update, "_backend_name": self.name}
             kwargs["update"] = update
-        return super().model_copy(**kwargs)  # type: ignore[return-value]
+        return super().model_copy(**kwargs)
 
     @classmethod
     def from_mcp_tool(
@@ -184,7 +180,7 @@ class ProxyResource(Resource):
             # First time uri is being changed, preserve original for backend calls
             update = {**update, "_backend_uri": str(self.uri)}
             kwargs["update"] = update
-        return super().model_copy(**kwargs)  # type: ignore[return-value]
+        return super().model_copy(**kwargs)
 
     @classmethod
     def from_mcp_resource(
@@ -270,7 +266,7 @@ class ProxyTemplate(ResourceTemplate):
             # First time uri_template is being changed, preserve original for backend
             update = {**update, "_backend_uri_template": self.uri_template}
             kwargs["update"] = update
-        return super().model_copy(**kwargs)  # type: ignore[return-value]
+        return super().model_copy(**kwargs)
 
     @classmethod
     def from_mcp_template(  # type: ignore[override]
@@ -379,7 +375,7 @@ class ProxyPrompt(Prompt):
             # First time name is being changed, preserve original for backend calls
             update = {**update, "_backend_name": self.name}
             kwargs["update"] = update
-        return super().model_copy(**kwargs)  # type: ignore[return-value]
+        return super().model_copy(**kwargs)
 
     @classmethod
     def from_mcp_prompt(
@@ -455,8 +451,6 @@ class ProxyProvider(Provider):
     def __init__(
         self,
         client_factory: ClientFactoryT,
-        *,
-        tool_transformations: dict[str, ToolTransformConfig] | None = None,
     ):
         """Initialize a ProxyProvider.
 
@@ -464,11 +458,9 @@ class ProxyProvider(Provider):
             client_factory: A callable that returns a Client instance when called.
                            This gives you full control over session creation and reuse.
                            Can be either a synchronous or asynchronous function.
-            tool_transformations: Optional tool transformations to apply to proxy tools.
         """
         super().__init__()
         self.client_factory = client_factory
-        self.tool_transformations = tool_transformations or {}
 
     async def _get_client(self) -> Client:
         """Gets a client instance by calling the sync or async factory."""
@@ -487,16 +479,9 @@ class ProxyProvider(Provider):
             client = await self._get_client()
             async with client:
                 mcp_tools = await client.list_tools()
-                tools = {
-                    t.name: ProxyTool.from_mcp_tool(self.client_factory, t)
-                    for t in mcp_tools
-                }
-                # Apply tool transformations if configured
-                if self.tool_transformations:
-                    tools = apply_transformations_to_tools(
-                        tools, self.tool_transformations
-                    )
-                return list(tools.values())
+                return [
+                    ProxyTool.from_mcp_tool(self.client_factory, t) for t in mcp_tools
+                ]
         except McpError as e:
             if e.error.code == METHOD_NOT_FOUND:
                 return []
@@ -670,13 +655,10 @@ class FastMCPProxy(FastMCP):
                            Can be either a synchronous or asynchronous function.
             **kwargs: Additional settings for the FastMCP server.
         """
-        # Extract tool_transformations before passing to parent
-        tool_transformations = kwargs.pop("tool_transformations", None)
         super().__init__(**kwargs)
         self.client_factory = client_factory
-        self.add_provider(
-            ProxyProvider(client_factory, tool_transformations=tool_transformations)
-        )
+        provider: Provider = ProxyProvider(client_factory)
+        self.add_provider(provider)
 
 
 # -----------------------------------------------------------------------------
@@ -711,7 +693,7 @@ async def default_proxy_sampling_handler(
         role="assistant",
         model="fastmcp-client",
         # TODO(ty): remove when ty supports isinstance exclusion narrowing
-        content=content,  # type: ignore[arg-type]
+        content=content,
     )
 
 
