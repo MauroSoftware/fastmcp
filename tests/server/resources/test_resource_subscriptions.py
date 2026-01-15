@@ -9,6 +9,7 @@ Tests the full resource subscription flow including:
 - Server capability advertisement
 """
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -141,14 +142,10 @@ class TestResourceNotifications:
             await server.notify_resource_updated("resource://test/dynamic")
 
             # Small delay for notification propagation
-            import asyncio
-
             await asyncio.sleep(0.05)
 
             # Verify notification was received
-            notifications = handler.get_notifications(
-                "notifications/resources/updated"
-            )
+            notifications = handler.get_notifications("notifications/resources/updated")
             assert len(notifications) == 1
 
             # Verify notification content
@@ -170,14 +167,10 @@ class TestResourceNotifications:
             assert result is not None
 
             # Small delay
-            import asyncio
-
             await asyncio.sleep(0.05)
 
             # Verify no notifications were sent
-            notifications = handler.get_notifications(
-                "notifications/resources/updated"
-            )
+            notifications = handler.get_notifications("notifications/resources/updated")
             assert len(notifications) == 0
 
     @pytest.mark.asyncio
@@ -198,8 +191,6 @@ class TestResourceNotifications:
 
             # Trigger notification
             await server.notify_resource_updated("resource://test/dynamic")
-
-            import asyncio
 
             await asyncio.sleep(0.05)
 
@@ -265,13 +256,9 @@ class TestResourceTemplateSubscriptions:
             # Trigger notification for the specific URI
             await server.notify_resource_updated("resource://items/123")
 
-            import asyncio
-
             await asyncio.sleep(0.05)
 
-            notifications = handler.get_notifications(
-                "notifications/resources/updated"
-            )
+            notifications = handler.get_notifications("notifications/resources/updated")
             assert len(notifications) == 1
             notification_root = notifications[0].notification.root
             assert isinstance(notification_root, mcp.types.ResourceUpdatedNotification)
