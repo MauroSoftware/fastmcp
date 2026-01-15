@@ -170,11 +170,14 @@ class LowLevelServer(_Server[LifespanResultT, RequestT]):
         notification_options: NotificationOptions,
         experimental_capabilities: dict[str, dict[str, Any]],
     ) -> mcp.types.ServerCapabilities:
-        """Override to set capabilities.tasks as a first-class field per SEP-1686.
+        """Override to set capabilities.tasks and resources.subscribe.
 
-        This ensures task capabilities appear in capabilities.tasks instead of
-        capabilities.experimental.tasks, which is required by the MCP spec and
-        enables proper task detection by clients like VS Code Copilot 1.107+.
+        This ensures:
+        - Task capabilities appear in capabilities.tasks instead of
+          capabilities.experimental.tasks, which is required by the MCP spec and
+          enables proper task detection by clients like VS Code Copilot 1.107+.
+        - Resource subscription capability is advertised when resources are available,
+          enabling clients to use resources/subscribe and resources/unsubscribe.
         """
         from fastmcp.server.tasks.capabilities import get_task_capabilities
 
@@ -188,6 +191,13 @@ class LowLevelServer(_Server[LifespanResultT, RequestT]):
         # Set tasks as a first-class field (not experimental) per SEP-1686
         capabilities.tasks = get_task_capabilities()
 
+        # Enable resource subscriptions if resources capability exists
+        if capabilities.resources is not None:
+            capabilities.resources = mcp.types.ResourcesCapability(
+                subscribe=True,
+                listChanged=capabilities.resources.listChanged,
+            )
+
         return capabilities
 
     async def run(
@@ -198,8 +208,11 @@ class LowLevelServer(_Server[LifespanResultT, RequestT]):
         raise_exceptions: bool = False,
         stateless: bool = False,
     ):
-        """
-        Overrides the run method to use the MiddlewareServerSession.
+        """Overrides the run method to use the MiddlewareServerSession.
+
+        This method handles all FastMCP transports (stdio, SSE, streamable HTTP).
+        The finally block ensures resource subscription cleanup happens for all
+        exit scenarios (normal completion, errors, cancellation).
         """
         async with AsyncExitStack() as stack:
             lifespan_context = await stack.enter_async_context(self.lifespan(self))
@@ -213,18 +226,24 @@ class LowLevelServer(_Server[LifespanResultT, RequestT]):
                 )
             )
 
-            async with anyio.create_task_group() as tg:
-                # Store task group on session for subscription tasks (SEP-1686)
-                session._subscription_task_group = tg
+            try:
+                async with anyio.create_task_group() as tg:
+                    # Store task group on session for subscription tasks (SEP-1686)
+                    session._subscription_task_group = tg
 
-                async for message in session.incoming_messages:
-                    tg.start_soon(
-                        self._handle_message,
-                        message,
-                        session,
-                        lifespan_context,
-                        raise_exceptions,
-                    )
+                    async for message in session.incoming_messages:
+                        tg.start_soon(
+                            self._handle_message,
+                            message,
+                            session,
+                            lifespan_context,
+                            raise_exceptions,
+                        )
+            finally:
+                # Clean up resource subscriptions when session ends
+                await self.fastmcp._resource_subscription_manager.cleanup_on_disconnect(
+                    session
+                )
 
     def read_resource(
         self,

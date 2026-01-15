@@ -276,6 +276,11 @@ class FastMCP(Generic[LifespanResultT]):
         self._docket = None
         self._worker = None
 
+        # Resource subscription manager for MCP resource subscriptions
+        from fastmcp.server.resources.subscriptions import ResourceSubscriptionManager
+
+        self._resource_subscription_manager = ResourceSubscriptionManager()
+
         self._additional_http_routes: list[BaseRoute] = []
 
         # Create LocalProvider for local components
@@ -698,6 +703,9 @@ class FastMCP(Generic[LifespanResultT]):
         # Register SEP-1686 task protocol handlers
         self._setup_task_protocol_handlers()
 
+        # Register resource subscription handlers
+        self._setup_resource_subscription_handlers()
+
     def _setup_task_protocol_handlers(self) -> None:
         """Register SEP-1686 task protocol handlers with SDK.
 
@@ -758,6 +766,44 @@ class FastMCP(Generic[LifespanResultT]):
         )
         self._mcp_server.request_handlers[ListTasksRequest] = handle_list_tasks
         self._mcp_server.request_handlers[CancelTaskRequest] = handle_cancel_task
+
+    def _setup_resource_subscription_handlers(self) -> None:
+        """Register MCP resource subscription handlers.
+
+        Handles resources/subscribe and resources/unsubscribe requests.
+        Uses request_ctx from the MCP SDK to get the current session.
+        """
+        from mcp.server.lowlevel.server import request_ctx
+        from mcp.types import (
+            EmptyResult,
+            ServerResult,
+            SubscribeRequest,
+            UnsubscribeRequest,
+        )
+
+        async def handle_subscribe(req: SubscribeRequest) -> ServerResult:
+            """Handle resources/subscribe request."""
+            ctx = request_ctx.get()
+            if ctx is None:
+                raise RuntimeError("No request context available")
+            session = ctx.session
+            uri = req.params.uri
+            await self._resource_subscription_manager.subscribe(str(uri), session)
+            return ServerResult(EmptyResult())
+
+        async def handle_unsubscribe(req: UnsubscribeRequest) -> ServerResult:
+            """Handle resources/unsubscribe request."""
+            ctx = request_ctx.get()
+            if ctx is None:
+                raise RuntimeError("No request context available")
+            session = ctx.session
+            uri = req.params.uri
+            await self._resource_subscription_manager.unsubscribe(str(uri), session)
+            return ServerResult(EmptyResult())
+
+        # Register handlers with the MCP server
+        self._mcp_server.request_handlers[SubscribeRequest] = handle_subscribe
+        self._mcp_server.request_handlers[UnsubscribeRequest] = handle_unsubscribe
 
     async def _run_middleware(
         self,
@@ -1298,6 +1344,39 @@ class FastMCP(Generic[LifespanResultT]):
                 raise NotFoundError(f"Unknown resource template: {uri}")
 
         return template
+
+    async def notify_resource_updated(self, uri: str) -> None:
+        """Notify all subscribers that a resource has been updated.
+
+        Call this method when the content of a resource changes to notify
+        subscribed clients. Clients can then decide whether to fetch the
+        updated content via resources/read.
+
+        This follows the MCP decoupled pub/sub model where:
+        - Notifications are sent ONLY when developer explicitly calls this method
+        - NOT sent automatically on resource reads
+        - Matches the pattern of list_changed notifications in FastMCP
+
+        Args:
+            uri: The URI of the resource that was updated
+
+        Example:
+            ```python
+            server = FastMCP("my-server")
+
+            sensor_data = {"temperature": 20}
+
+            @server.resource("resource://sensors/temp")
+            def get_temperature() -> str:
+                return f"Temperature: {sensor_data['temperature']}°C"
+
+            # When data changes, notify subscribers
+            async def update_temperature(new_temp: int):
+                sensor_data['temperature'] = new_temp
+                await server.notify_resource_updated("resource://sensors/temp")
+            ```
+        """
+        await self._resource_subscription_manager.notify_subscribers(uri)
 
     async def get_prompts(self, *, run_middleware: bool = False) -> list[Prompt]:
         """Get all enabled prompts from providers.

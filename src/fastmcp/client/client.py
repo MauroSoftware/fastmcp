@@ -329,6 +329,9 @@ class Client(Generic[ClientTransportT]):
         # Track task IDs submitted by this client (for list_tasks support)
         self._submitted_task_ids: set[str] = set()
 
+        # Track subscribed resource URIs for client-side convenience
+        self._subscribed_resources: set[str] = set()
+
         # Registry for routing notifications/tasks/status to Task objects
 
         self._task_registry: dict[
@@ -633,6 +636,9 @@ class Client(Generic[ClientTransportT]):
             # wait for session to finish to ensure state has been reset
             await self._session_state.session_task
             self._session_state.session_task = None
+
+            # Clear client-side subscription tracking (server handles cleanup automatically)
+            self._subscribed_resources.clear()
 
     async def _session_runner(self):
         """
@@ -1035,17 +1041,48 @@ class Client(Generic[ClientTransportT]):
                 immediate_result=raw_result.contents,
             )
 
-    # async def subscribe_resource(self, uri: AnyUrl | str) -> None:
-    #     """Send a resources/subscribe request."""
-    #     if isinstance(uri, str):
-    #         uri = AnyUrl(uri)
-    #     await self.session.subscribe_resource(uri)
+    async def subscribe_resource(self, uri: AnyUrl | str) -> None:
+        """Subscribe to updates for a resource URI.
 
-    # async def unsubscribe_resource(self, uri: AnyUrl | str) -> None:
-    #     """Send a resources/unsubscribe request."""
-    #     if isinstance(uri, str):
-    #         uri = AnyUrl(uri)
-    #     await self.session.unsubscribe_resource(uri)
+        Sends a resources/subscribe request to the server. When the server
+        calls notify_resource_updated() for this URI, the client will receive
+        a ResourceUpdatedNotification.
+
+        Note: The server handles subscription cleanup automatically when the
+        session ends. Client-side tracking is maintained for convenience but
+        explicit unsubscription before disconnect is optional.
+
+        Args:
+            uri: The resource URI to subscribe to
+
+        Raises:
+            RuntimeError: If called while the client is not connected.
+        """
+        if isinstance(uri, str):
+            uri = AnyUrl(uri)
+        await self.session.subscribe_resource(uri)
+        self._subscribed_resources.add(str(uri))
+
+    async def unsubscribe_resource(self, uri: AnyUrl | str) -> None:
+        """Unsubscribe from updates for a resource URI.
+
+        Sends a resources/unsubscribe request to the server. After this,
+        the client will no longer receive ResourceUpdatedNotification for
+        this URI.
+
+        Note: Client-side tracking is always cleared even if the server
+        request fails. The server handles cleanup automatically on disconnect.
+
+        Args:
+            uri: The resource URI to unsubscribe from
+
+        Raises:
+            RuntimeError: If called while the client is not connected.
+        """
+        if isinstance(uri, str):
+            uri = AnyUrl(uri)
+        await self.session.unsubscribe_resource(uri)
+        self._subscribed_resources.discard(str(uri))
 
     # --- Prompts ---
 
