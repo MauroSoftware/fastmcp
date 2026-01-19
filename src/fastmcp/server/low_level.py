@@ -244,6 +244,7 @@ class LowLevelServer(_Server[LifespanResultT, RequestT]):
                 await self.fastmcp._resource_subscription_manager.cleanup_on_disconnect(
                     session
                 )
+                await self.fastmcp._run_session_disconnect_handlers(session)
 
     def read_resource(
         self,

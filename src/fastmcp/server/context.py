@@ -390,6 +390,17 @@ class Context:
             )
         return result
 
+    async def notify_resource_updated(self, uri: str | AnyUrl) -> None:
+        """Notify subscribers that a resource has been updated.
+
+        This is a convenience wrapper around FastMCP.notify_resource_updated().
+        It works even when called from within a request context.
+
+        Args:
+            uri: Resource URI that was updated
+        """
+        await self.fastmcp.notify_resource_updated(str(uri))
+
     async def log(
         self,
         message: str,

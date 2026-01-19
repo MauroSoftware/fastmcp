@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     from fastmcp.server.providers.openapi import RouteMap
     from fastmcp.server.providers.openapi import RouteMapFn as OpenAPIRouteMapFn
     from fastmcp.server.providers.proxy import FastMCPProxy
+    from mcp.server.session import ServerSession
     from fastmcp.tools.tool import ToolResultSerializerType
 
 logger = get_logger(__name__)
@@ -280,6 +281,15 @@ class FastMCP(Generic[LifespanResultT]):
         from fastmcp.server.resources.subscriptions import ResourceSubscriptionManager
 
         self._resource_subscription_manager = ResourceSubscriptionManager()
+        self._resource_subscribe_handlers: list[
+            Callable[[str, "ServerSession"], Awaitable[None]]
+        ] = []
+        self._resource_unsubscribe_handlers: list[
+            Callable[[str, "ServerSession"], Awaitable[None]]
+        ] = []
+        self._session_disconnect_handlers: list[
+            Callable[["ServerSession"], Awaitable[None]]
+        ] = []
 
         self._additional_http_routes: list[BaseRoute] = []
 
@@ -789,6 +799,9 @@ class FastMCP(Generic[LifespanResultT]):
             session = ctx.session
             uri = req.params.uri
             await self._resource_subscription_manager.subscribe(str(uri), session)
+            for handler in list(self._resource_subscribe_handlers):
+                with suppress(Exception):
+                    await handler(str(uri), session)
             return ServerResult(EmptyResult())
 
         async def handle_unsubscribe(req: UnsubscribeRequest) -> ServerResult:
@@ -799,6 +812,9 @@ class FastMCP(Generic[LifespanResultT]):
             session = ctx.session
             uri = req.params.uri
             await self._resource_subscription_manager.unsubscribe(str(uri), session)
+            for handler in list(self._resource_unsubscribe_handlers):
+                with suppress(Exception):
+                    await handler(str(uri), session)
             return ServerResult(EmptyResult())
 
         # Register handlers with the MCP server
@@ -1377,6 +1393,31 @@ class FastMCP(Generic[LifespanResultT]):
             ```
         """
         await self._resource_subscription_manager.notify_subscribers(uri)
+
+    def add_resource_subscribe_handler(
+        self, handler: Callable[[str, "ServerSession"], Awaitable[None]]
+    ) -> None:
+        """Register a handler to run after resources/subscribe."""
+        self._resource_subscribe_handlers.append(handler)
+
+    def add_resource_unsubscribe_handler(
+        self, handler: Callable[[str, "ServerSession"], Awaitable[None]]
+    ) -> None:
+        """Register a handler to run after resources/unsubscribe."""
+        self._resource_unsubscribe_handlers.append(handler)
+
+    def add_session_disconnect_handler(
+        self, handler: Callable[["ServerSession"], Awaitable[None]]
+    ) -> None:
+        """Register a handler to run when a session disconnects."""
+        self._session_disconnect_handlers.append(handler)
+
+    async def _run_session_disconnect_handlers(
+        self, session: "ServerSession"
+    ) -> None:
+        for handler in list(self._session_disconnect_handlers):
+            with suppress(Exception):
+                await handler(session)
 
     async def get_prompts(self, *, run_middleware: bool = False) -> list[Prompt]:
         """Get all enabled prompts from providers.
